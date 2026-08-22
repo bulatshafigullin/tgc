@@ -3,17 +3,18 @@ description "Opt-in thread-local garbage collector for D - per-thread heaps with
 authors "amdphreak"
 copyright "Copyright (c) 2026, dlang-supplemental contributors"
 license "BSL-1.0"
-version "0.1.0"
-
-targetType "library"
-targetName "tgc"
+version "0.1.1"
 
 importPaths "source"
-sourcePaths "source"
+
+configuration "library" {
+    targetType "library"
+    targetName "tgc"
+    sourcePaths "source"
+}
 
 configuration "unittest" {
-    versions "Tgc_default"
     targetType "library"
     sourcePaths "source" "test"
-    importPaths "source"
+    versions "Tgc_default"
 }
