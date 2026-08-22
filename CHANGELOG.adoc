@@ -1,0 +1,7 @@
+= changelog
+
+== 2026-08-22 - Initial DUB release
+
+* Publish `tgc` as a DUB library vendoring `core.internal.gc.impl.tgc.gc` from the dlang-supplemental DMD fork (`feature/tgc`).
+* Public entry module `tgc.gcobj` registers the `tgc` GC factory; optional `Tgc_default` version sets `rt_options`.
+* Smoke unittest adapted from druntime `test/gc/tgc.d`.

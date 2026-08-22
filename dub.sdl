@@ -1,0 +1,19 @@
+name "tgc"
+description "Opt-in thread-local garbage collector for D - per-thread heaps without global stop-the-world"
+authors "amdphreak"
+copyright "Copyright (c) 2026, dlang-supplemental contributors"
+license "BSL-1.0"
+version "0.1.0"
+
+targetType "library"
+targetName "tgc"
+
+importPaths "source"
+sourcePaths "source"
+
+configuration "unittest" {
+    versions "Tgc_default"
+    targetType "library"
+    sourcePaths "source" "test"
+    importPaths "source"
+}
