@@ -1,0 +1,83 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  encoding:
+    name: encoding guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject non-UTF-8 / BOM / CRLF tracked files
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            case "$(file -b --mime-type "$f")" in
+              text/*|application/json|inode/x-empty) ;;
+              *) continue ;;
+            esac
+            if ! iconv -f UTF-8 -t UTF-8 "$f" >/dev/null 2>&1; then
+              echo "::error file=$f::not valid UTF-8"; fail=1
+            fi
+            if [ "$(head -c 3 "$f" | xxd -p)" = "efbbbf" ]; then
+              echo "::error file=$f::has a UTF-8 BOM"; fail=1
+            fi
+            if grep -qU $'\r' "$f"; then
+              echo "::error file=$f::contains CRLF line endings"; fail=1
+            fi
+          done < <(git ls-files)
+          exit $fail
+
+  test:
+    name: ${{ matrix.compiler }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        compiler: [dmd-latest, ldc-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dlang-community/setup-dlang@v1
+        with:
+          compiler: ${{ matrix.compiler }}
+      - name: Build
+        run: dub build
+      - name: Test
+        run: dub test
+      # Pointers live in registers, dead stores vanish and stack slots get
+      # reused only once the optimizer runs; an unoptimized-only test suite
+      # cannot see any of it.
+      - name: Test (optimized)
+        run: dub test --build=unittest-optimized
+
+  sanitizers:
+    name: ldc / ${{ matrix.sanitizer }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dlang-community/setup-dlang@v1
+        with:
+          compiler: ldc-latest
+      # A garbage collector is exactly the code sanitizers are for: use-after-free
+      # from over-eager sweeping, and races on cross-thread heap access.
+      - name: Test under -fsanitize=${{ matrix.sanitizer }}
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+          TSAN_OPTIONS: halt_on_error=1
+        run: dub test --compiler=ldc2 --build=unittest --d-version=TgcSanitize
+             --dflags=-fsanitize=${{ matrix.sanitizer }} --dflags=-g
