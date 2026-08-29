@@ -18,3 +18,10 @@ configuration "unittest" {
     sourcePaths "source" "test"
     versions "Tgc_default"
 }
+
+// A GC must be correct under optimization: pointers move into registers, dead
+// stores vanish, and stack slots are reused. The default unittest build is
+// unoptimized and hides all of that.
+buildType "unittest-optimized" {
+    buildOptions "unittests" "optimize" "inline" "debugInfo"
+}

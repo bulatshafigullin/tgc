@@ -33,6 +33,29 @@ extern(C) __gshared rt_options = ["gcopt=gc:tgc"];
 * DMD 2.112+ or LDC with pluggable GC + `registerGCFactory` thread init hook (same era as SymGC integration).
 * Prefer message passing / ownership transfer across threads; unrestricted shared mutable GC pointers are unsupported in v1.
 
+== Design
+
+Each thread allocates from private 64 KiB chunk-aligned arenas carved into
+size-class slots. Because chunks are aligned to their own size, a candidate
+pointer is resolved to its block by masking and indexing rather than by
+searching, so marking, `GC.free` and `GC.sizeOf` are all constant time. The
+mark phase uses an explicit worklist, visiting each live block exactly once.
+
+A collection scans only the collecting thread's stack, callee-saved registers,
+TLS and the shared root/range tables. `thread_suspendAll` is never called, and
+the root tables are snapshotted rather than held locked for the duration.
+
+=== Limitations
+
+* *Cross-thread sharing is unsupported in v1.* A block handed to another thread
+  is still owned by the allocating thread's heap, and that heap's collector
+  never scans the other thread's stack — so the block can be swept while still
+  in use. Use `immutable` or copied message passing. This is not yet enforced
+  at runtime; see `IMPROVEMENTS.md`.
+* `GC.collect()` collects only the calling thread's heap. A thread that never
+  allocates never collects.
+* Marking is conservative; no precise scanning or moving/compaction.
+
 == Changelog
 
 See link:CHANGELOG.adoc[CHANGELOG.adoc].

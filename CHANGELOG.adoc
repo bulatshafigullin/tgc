@@ -1,5 +1,117 @@
 = changelog
 
+== Unreleased
+
+=== Fixed — memory safety
+
+* *Thread-local storage is now scanned.* `markTLS` was guarded by
+  `static if (__traits(compiles, { import rt.sections; ... }))`, which never
+  succeeds in a normal build, so the whole body compiled away silently and any
+  object reachable only from a thread-local global was freed while still live.
+  TLS ranges are now scanned through druntime's per-thread `rt.tlsgc` handle.
+* *Callee-saved registers are now scanned.* The mark phase scanned the stack
+  without spilling registers first, so a pointer held only in a register — the
+  norm in optimized builds — was invisible and its block was collected.
+  Collection now runs inside `callWithStackShell`.
+* *Payload alignment is 16 bytes*, as D requires. It was 8, which misaligns
+  `real`, SIMD vectors and `align(16)` aggregates; an aligned SSE store into
+  such a block faults on x86-64.
+* *One-past-the-end pointers are honoured during marking.* D slices routinely
+  materialise `ptr + length`; treating that as a non-reference freed live
+  arrays. Exact lookups still reject it, so `GC.free(arr.ptr + arr.length)`
+  cannot destroy a neighbouring block.
+* *`GC.disable()` no longer suppresses an explicit `GC.collect()`.* It now
+  suppresses only allocation-triggered collections, and nests as a counter.
+* *Destructors run for objects alive at thread exit.* `cleanupThread` freed
+  every remaining block without finalizing. It also tore the heap down before
+  unregistering it, racing other threads' lookups; the order is now reversed.
+* *`TypeInfo` is recorded at allocation* and passed to `rt_finalizeFromGC`, so
+  struct finalizers can run. It was discarded and `null` was passed.
+* *`realloc` no longer corrupts heap accounting.* Shrinking rewrote the stored
+  block size without adjusting `usedBytes`, permanently skewing the collection
+  trigger.
+* *Cross-thread state is atomic.* `disabled` and the profiling counters were
+  plain fields written from every thread.
+* Collection on an unattached thread is refused rather than guessing a stack
+  window, which could read unmapped memory.
+* `removeRoot`/`removeRange` no longer `assert(false)` — that halted the
+  process in release builds when removing an unknown root.
+* `runFinalizers(segment)` is implemented instead of being a no-op.
+
+=== Changed — performance
+
+* *Chunk-arena allocator.* Memory now comes from 64 KiB chunk-aligned arenas
+  carved into size-class slots. A candidate pointer resolves to its block by
+  masking and indexing instead of walking a linked list, so `markPtr`,
+  `GC.free`, `GC.sizeOf` and `GC.addrOf` are all O(1).
+* *Explicit mark worklist* replaces the rescan-until-stable fixpoint, which
+  re-walked the entire heap once per pointer-graph level. Each live block is
+  now scanned exactly once.
++
+Measured collection time for a heap of N live 32-byte objects:
++
+[cols="1,1,1"]
+|===
+| live objects | before | after
+
+| 2,000  | 21 ms  | 0.05 ms
+| 8,000  | 176 ms | 0.09 ms
+| 16,000 | 577 ms | 0.15 ms
+| 256,000 | (minutes) | 1.83 ms
+|===
++
+Scaling is now linear rather than quadratic.
+
+* *Array API implemented* (`getArrayUsed`, `expandArrayUsed`,
+  `reserveArrayCapacity`, `shrinkArrayUsed`, `extend`). These all returned a
+  failure constant, which forced the runtime to reallocate and copy on *every*
+  `arr ~= x`. Appending 100,000 elements went from 100,000 reallocations to 13.
+* *The collection threshold decays.* It previously only ever grew, so a program
+  that spiked once and then settled would never collect again.
+* Fully empty chunks are returned to the allocator during sweep and
+  `minimize()`; `stats().freeSize` reports real numbers instead of always `0`.
+* Root and range tables are snapshotted under `rootsLock` and marked outside
+  it. Marking under the lock made every other thread spin for the duration of
+  a collection — a global pause in all but name.
+* Pause time is measured: `profileStats()` reports `totalPauseTime` and
+  `maxPauseTime`. `profilePauseTicks` was declared and never written.
+
+=== Infrastructure
+
+* Converted `AGENTS.md`, `README.adoc`, `LICENSE`, `.gitignore`,
+  `source/tgc/package.d`, `source/tgc/gcobj.d` and the publish workflow from
+  BOM-less UTF-16LE to UTF-8. The workflow was unparseable YAML, so the publish
+  pipeline could not run, and `.gitignore` matched nothing.
+* Added `.gitattributes` enforcing UTF-8 and LF.
+* Added a CI workflow: DMD and LDC across Linux/macOS/Windows, an encoding
+  guard, and AddressSanitizer/ThreadSanitizer jobs.
+* Added `test/tgc_safety.d`, an adversarial suite covering reachability
+  (TLS-only, `__gshared`-only, `addRoot`-only, interior and one-past-the-end
+  pointers), alignment, reclamation, `disable()` semantics, finalization at
+  thread exit, concurrent collection and array append. The previous smoke test
+  passed identically under `--DRT-gcopt=gc:conservative`, so it could not
+  detect either a failure to select tgc or tgc freeing live memory.
+* Added `test/tgc_stress.d`: pattern-checked allocator stress covering
+  size-class edges, the small/large chunk transition, chunk release and reuse,
+  explicit `free`, `realloc` across boundaries, concurrent churn and repeated
+  thread teardown.
+* Added a `unittest-optimized` build type; the unoptimized default hides
+  register-held pointers and dead-store elimination.
+* Mark routines are annotated `@noSanitize("address")` under LDC: conservative
+  scanning reads padding, redzones and quarantined memory by design, so those
+  reads must not be reported. Test iteration counts scale down under
+  `version(TgcSanitize)`.
+
+=== Fixed — found during this work
+
+* Use-after-free in the sweep: freeing the single slot of a large chunk
+  releases the chunk, but the loop then re-read `slotCount`/`freeCount` from
+  the freed header.
+* A finalizer that allocates could be handed a slot from the chunk being swept,
+  at an index the sweep had not yet reached, and that fresh object was then
+  immediately freed by the same sweep. Allocation now marks blocks black while
+  a collection is in flight.
+
 == 2026-08-22 - Initial DUB release
 
 * Publish `tgc` as a DUB library vendoring `core.internal.gc.impl.tgc.gc` from the dlang-supplemental DMD fork (`feature/tgc`).
