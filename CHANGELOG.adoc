@@ -50,6 +50,14 @@ use those objects. See `CROSS-THREAD.md`.
 
 === Changed — performance
 
+* *Heap growth factor is tunable and now defaults to 4* (`tgcHeapGrowth`).
+  It was hardcoded at 2, which kept the heap at twice the live set and made tgc
+  collect 135 times on binary-trees depth 18 where the conservative collector
+  collected 7 -- 1.76 s of a 2.81 s run spent collecting. A mark-sweep pause
+  costs time proportional to the live set rather than to the heap, so headroom
+  reduces how *often* collections happen without lengthening any one of them:
+  better for throughput and for pause count alike, at the cost of memory.
+
 * *Slot state moved into per-chunk bitvectors.* `allocated`, `marked` and
   `shared` were fields of a 24-byte `SlotMeta` per slot, so clearing every mark
   meant a read-modify-write across all of it and the sweep touched 24 bytes to
@@ -254,6 +262,23 @@ the original bug -- confirmed by running it against the pre-fix commit.
 * Fixed the CI sanitizer job, which could never have run: it passed
   `--dflags=...` to `dub test`, which dub rejects. The flags now live in
   `unittest-tsan` and `unittest-asan` build types.
+
+* *`GC.extend` claimed extensions it never performed — memory corruption.*
+  The contract is "enlarge the block by at least `minsize` *additional* bytes;
+  a non-zero return is the new total size". tgc read it as "is the block already
+  at least `minsize`", and returned the capacity whenever it looked big enough.
+  The runtime then believed the block had grown and wrote past the end of the
+  slot into its neighbour, corrupting the free-list pointer threaded through
+  free slots. A slot has a fixed size and cannot grow, so the only correct
+  answer is 0; in-place array growth goes through `expandArrayUsed`, which
+  checks against the real capacity.
++
+Present since the arena landed, and missed by the entire test suite. It was
+found by running the binary-trees benchmark, which crashed with SIGBUS on any
+program that combined a live linked structure with phobos string formatting.
+Regression tests added in `test/tgc_stress.d` cover both `GC.extend`'s contract
+and the formatting-plus-live-structure pattern; both fail against the previous
+commit.
 
 === Fixed — found during this work
 

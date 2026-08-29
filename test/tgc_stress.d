@@ -324,3 +324,95 @@ unittest
     verify(mine, 7, "main thread data damaged by other threads' teardown");
     keepAlive(mine.ptr);
 }
+
+// ---------------------------------------------------------------------------
+// GC.extend must not claim an extension it did not perform
+// ---------------------------------------------------------------------------
+
+unittest
+{
+    // `extend(p, minsize, maxsize, ti)` asks to enlarge the block by at least
+    // `minsize` *additional* bytes, and a non-zero return means it really was
+    // enlarged. Reading it as "is the block already this big" made tgc claim
+    // success without growing anything, after which the runtime wrote past the
+    // end of the slot into its neighbour — corrupting the free-list pointer
+    // threaded through free slots.
+    //
+    // This was found by running the binary-trees benchmark, not by this suite,
+    // which is why it is here now.
+    enum n = 400;
+    void*[] blocks;
+    foreach (i; 0 .. n)
+    {
+        auto p = GC.malloc(64);
+        (cast(ubyte*) p)[0 .. 64] = cast(ubyte)(i & 0xFF);
+        blocks ~= p;
+    }
+
+    foreach (i, p; blocks)
+    {
+        auto sz = GC.sizeOf(p);
+        // Ask for more than the block holds.
+        auto got = GC.extend(p, sz + 1, sz + 4096);
+        assert(got == 0 || got >= sz + 1,
+            "GC.extend returned a size that does not satisfy the request");
+        if (got != 0)
+        {
+            // If it claims success the space must genuinely be there; writing
+            // it must not disturb any neighbour.
+            (cast(ubyte*) p)[0 .. got] = cast(ubyte)(i & 0xFF);
+        }
+    }
+
+    // Every block must still hold its own pattern.
+    foreach (i, p; blocks)
+    {
+        auto b = cast(ubyte*) p;
+        foreach (k; 0 .. 64)
+            assert(b[k] == cast(ubyte)(i & 0xFF),
+                "GC.extend overran a block into its neighbour");
+    }
+
+    GC.collect();
+    foreach (i, p; blocks)
+    {
+        auto b = cast(ubyte*) p;
+        foreach (k; 0 .. 64)
+            assert(b[k] == cast(ubyte)(i & 0xFF),
+                "block damaged after a collection following GC.extend");
+    }
+    keepAlive(blocks.ptr);
+}
+
+unittest
+{
+    // The path that actually broke: phobos' formatting builds strings through
+    // the array-append machinery, interleaved with a live linked structure.
+    static class Node
+    {
+        Node left, right;
+        this(Node l, Node r) { left = l; right = r; }
+        int check() { int r = 1; if (left) r += left.check(); if (right) r += right.check(); return r; }
+        static Node create(int d)
+        {
+            if (d > 0) return new Node(create(d - 1), create(d - 1));
+            return new Node(null, null);
+        }
+    }
+
+    import std.format : format;
+
+    enum depth = 10 - (workScale > 1 ? 3 : 0);
+    auto longLived = Node.create(depth);
+    immutable expected = longLived.check();
+
+    foreach (round; 0 .. 40 / workScale)
+    {
+        auto t = Node.create(depth);
+        auto s = format("round %d check %d", round, t.check());
+        assert(s.length > 0);
+        assert(longLived.check() == expected,
+            "a long-lived structure was corrupted while formatting strings");
+    }
+    keepAlive(cast(void*) longLived);
+}

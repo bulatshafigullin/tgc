@@ -79,6 +79,25 @@ size_t tgcRetainedBytes() nothrow @nogc
     return tgc_getRetainedBytes();
 }
 
+/**
+ * Collect once a thread's live data has grown by this factor. Default 4.
+ *
+ * A mark-sweep pause costs time proportional to the live set, not to the heap,
+ * so extra headroom reduces how *often* collections happen without making any
+ * one of them longer. Raise it to trade memory for both throughput and fewer
+ * pauses; lower it (minimum 2) to keep the heap tight.
+ */
+void tgcHeapGrowth(size_t factor) nothrow @nogc
+{
+    tgc_setHeapGrowth(factor);
+}
+
+/// ditto
+size_t tgcHeapGrowth() nothrow @nogc
+{
+    return tgc_getHeapGrowth();
+}
+
 version (Tgc_default)
 {
     extern (C) __gshared string[] rt_options = [ "gcopt=gc:tgc" ];

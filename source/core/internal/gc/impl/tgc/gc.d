@@ -245,6 +245,30 @@ private enum size_t numClasses = sizeClasses.length;
 private enum size_t collectThresholdInit = 256 * 1024;
 
 /**
+ * Heap headroom: collect once live data has grown by this factor.
+ *
+ * With mark-sweep, a pause costs time proportional to the *live set*, while
+ * headroom only changes how often collections happen — so more headroom is
+ * better for both throughput and latency, and costs only memory. The old
+ * hardcoded 2 made tgc collect 135 times on binary-trees depth 18 where the
+ * conservative collector collected 7, spending 1.76 s of a 2.81 s run in the
+ * collector.
+ */
+private shared size_t heapGrowthFactor = 4;
+
+/// Set the heap growth factor; clamped to at least 2.
+extern (C) void tgc_setHeapGrowth(size_t factor) nothrow @nogc
+{
+    atomicStore(heapGrowthFactor, factor < 2 ? 2 : factor);
+}
+
+/// ditto
+extern (C) size_t tgc_getHeapGrowth() nothrow @nogc
+{
+    return atomicLoad(heapGrowthFactor);
+}
+
+/**
  * Whether to promote blocks observed reachable from a global root.
  *
  * Off by default, deliberately. Promotion closes a real hole — a block
@@ -1742,13 +1766,16 @@ class ThreadGC : GC
 
     size_t extend(void* p, size_t minsize, size_t maxsize, const TypeInfo ti) nothrow
     {
-        auto b = queryBlock(p);
-        if (!b.valid())
-            return 0;
-        // A slot cannot grow, but it may already be large enough: size classes
-        // and chunk rounding routinely leave usable slack.
-        auto cap = b.capacity();
-        return cap >= minsize ? cap : 0;
+        // `minsize` is how many *additional* bytes the caller needs, and a
+        // non-zero return means the block really was enlarged. A slot has a
+        // fixed size and cannot grow, so the only correct answer is 0.
+        //
+        // Returning the capacity when it merely looked big enough told the
+        // runtime an extension had succeeded, and it then wrote past the end of
+        // the slot into its neighbour -- corrupting the free-list pointer
+        // threaded through free slots. In-place growth for arrays goes through
+        // expandArrayUsed, which checks against the real capacity.
+        return 0;
     }
 
     size_t reserve(size_t size) nothrow
@@ -2254,7 +2281,7 @@ private:
         // Recompute the trigger from what actually survived. The previous
         // scheme only ever raised the threshold, so a program that spiked once
         // and then settled would never collect again.
-        heap.collectThreshold = heap.usedBytes * 2;
+        heap.collectThreshold = heap.usedBytes * atomicLoad(heapGrowthFactor);
         if (heap.collectThreshold < collectThresholdInit)
             heap.collectThreshold = collectThresholdInit;
 
