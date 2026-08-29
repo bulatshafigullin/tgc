@@ -65,33 +65,37 @@ barrier that is also missing for concurrent marking. Same wall as FUGC.
 **Copying/compaction does not transfer.** It requires knowing precisely which
 words are pointers. tgc is conservative by design, so it cannot move anything.
 
-## Heap sizing — transfers, but not for the reason I assumed
+## Heap sizing — transfers, but far less aggressively than BEAM
 
-BEAM tapers heap growth as heaps get larger. I assumed the benefit was memory
-and that pause time was unaffected, on the grounds that a mark-sweep pause costs
-time proportional to the *live set*. **That was wrong**, and measuring it is what
-showed the error: clearing marks and sweeping both walk the whole heap, not just
-the live part, so a bigger heap does lengthen every collection.
+BEAM tapers heap growth as heaps get larger. Two things came out of trying to
+copy that, and both were corrections.
 
-Measured on binary-trees depth 18, where the live set is identical in both:
+**First correction.** When the growth factor was introduced I claimed headroom
+could not lengthen a pause, because a mark-sweep pause costs time proportional
+to the *live set*. That is wrong: clearing marks and sweeping both walk the whole
+heap rather than just the live part, so a bigger heap lengthens every collection.
 
-| growth policy | time | heap | max pause |
-|---|---|---|---|
-| flat x4 | 2.82 s | 96 MB | 47.9 ms |
-| tapered | 2.43 s | 48 MB | 25.1 ms |
+**Second correction.** BEAM's actual numbers — Fibonacci growth, then +20% —
+do not transfer, because BEAM's per-process heaps are kilobytes and copying a
+tiny live set is cheap. tgc's heaps are whole threads. A +20% cap was measured
+at 296 collections on a 67 MB live set where a looser cap needed 76.
 
-The taper wins on all three axes. It is now the default: headroom is
-`live * (factor - 1)`, capped at `max(32 MiB, live / 5)`, so small heaps get the
-full multiplier and large ones converge on +20% — the same shape as BEAM's, for
-a reason BEAM does not have to care about.
+Measured on binary-trees, single-threaded, on an unloaded machine:
 
-### A measurement caveat worth recording
+| policy | d18 time | d18 heap | d18 max pause | d20 time | d20 heap | d20 max pause |
+|---|---|---|---|---|---|---|
+| flat x4 | 2.82 s | 96 MB | 47.9 ms | 9.39 s | 448 MB | 126.8 ms |
+| flat x3 | 2.28 s | 32 MB | 47.5 ms | 10.11 s | 256 MB | 133.8 ms |
+| cap at +20% | 2.43 s | 48 MB | 25.1 ms | 19.31 s | 128 MB | 74.0 ms |
+| **cap at live x2** | **2.25 s** | 48 MB | **23.8 ms** | **10.74 s** | **128 MB** | **110.7 ms** |
 
-Depth 20 results in this repository's history are unreliable. That configuration
-reaches 448 MB with a flat multiplier, and the development machine was down to
-~78 MB of free RAM with 13.8 GB of 14.3 GB swap in use, so those runs measure
-paging rather than collector behaviour. Anything above roughly 100 MB of heap
-needs re-measuring on a machine with headroom before it is quoted.
+The last row is the default: headroom is `live * (factor - 1)` capped at
+`max(32 MiB, live * 2)`, so the effective multiplier decays from 4 toward 3 as
+the heap grows. Against a flat x3 it halves the heap at depth 20 (128 MB against
+256 MB) and cuts max pause, for about 6% throughput. Against flat x4 it uses a
+quarter of the memory with a lower max pause.
+
+The shape of BEAM's idea survives; its constants do not.
 
 ## Sources
 

@@ -257,22 +257,25 @@ private enum size_t collectThresholdInit = 256 * 1024;
 private shared size_t heapGrowthFactor = 4;
 
 /**
- * Headroom above which the growth factor tapers toward +20%.
+ * Floor on the absolute headroom allowed between collections.
  *
- * A flat multiplier is fine while the heap is small and ruinous once it is
- * large: x4 on a 1 GB live set means not collecting until 4 GB. BEAM solves the
- * same problem by growing its per-process heaps along a Fibonacci-ish sequence
- * up to about a megaword and then in 20% increments; this is the same shape,
- * expressed as a cap on the absolute headroom.
+ * A flat multiplier is fine while the heap is small and wasteful once it is
+ * large: x4 on a 1 GB live set means not collecting until 4 GB. Headroom is
+ * therefore capped, so the effective multiplier decays from the configured
+ * factor toward 3 as the heap grows. BEAM does the same thing more
+ * aggressively -- Fibonacci growth up to about a megaword, then 20% increments
+ * -- but its per-process heaps are kilobytes, and copying tiny live sets is
+ * cheap. Measured on a 67 MB live set, a +20% cap cost 296 collections against
+ * 76 for this one.
  */
-private enum size_t growthTaperAbove = 32 * 1024 * 1024;
+private enum size_t growthHeadroomFloor = 32 * 1024 * 1024;
 
 /// Collection threshold for a heap holding `live` bytes.
 private size_t thresholdFor(size_t live) nothrow @nogc
 {
     immutable size_t g = atomicLoad(heapGrowthFactor);
     immutable size_t wanted = live * (g - 1);
-    immutable size_t capped = growthTaperAbove > live / 5 ? growthTaperAbove : live / 5;
+    immutable size_t capped = growthHeadroomFloor > live * 2 ? growthHeadroomFloor : live * 2;
     immutable size_t headroom = wanted < capped ? wanted : capped;
 
     size_t t = live + headroom;

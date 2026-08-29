@@ -62,17 +62,18 @@ the curve flattened from 0.20-0.38 to 0.21-0.29. The residual growth is
 inherent without a druntime change; see `IMPROVEMENTS.md`.
 
 * *Heap growth now tapers as the heap grows*, capping headroom at
-  `max(32 MiB, live / 5)` so small heaps get the full multiplier and large ones
-  converge on +20%. Borrowed from BEAM, which grows per-process heaps along a
-  Fibonacci sequence and then in 20% increments.
+  `max(32 MiB, live * 2)` so the effective multiplier decays from 4 toward 3.
+  The shape is borrowed from BEAM; its constants are not, because BEAM's
+  per-process heaps are kilobytes and a +20% cap costs tgc 296 collections on a
+  67 MB live set where this cap needs 76.
 +
 This corrects a claim made when the growth factor was introduced: that headroom
 cannot lengthen a pause because mark-sweep costs time proportional to the live
 set. Clearing marks and sweeping walk the whole heap, not just the live part, so
-a bigger heap does lengthen every collection. Measured on binary-trees depth 18,
-same live set both ways: flat x4 gave 2.82 s / 96 MB / 47.9 ms max pause, the
-taper gives 2.43 s / 48 MB / 25.1 ms -- better on all three axes. See
-`BEAM-NOTES.md`.
+a bigger heap does lengthen every collection. Measured on binary-trees on an unloaded
+machine, depth 18 / depth 20: flat x4 gave 2.82 s / 9.39 s using 96 MB / 448 MB;
+the cap gives 2.25 s / 10.74 s using 48 MB / 128 MB, with max pause 23.8 ms
+against 47.9 ms at depth 18. See `BEAM-NOTES.md`.
 
 * *Heap growth factor is tunable* (`tgcHeapGrowth`, default 4).
   It was hardcoded at 2, which kept the heap at twice the live set and made tgc
