@@ -50,6 +50,17 @@ use those objects. See `CROSS-THREAD.md`.
 
 === Changed — performance
 
+* *Fiber enumeration walks the global context list once instead of twice*, with
+  the cheap rejections first. Scanning was already restricted to the collecting
+  thread's own fibers; finding them still means walking druntime's global list,
+  because the ownership test must happen inside the thread lock -- once it is
+  released another thread may destroy its fiber and unmap the stack.
++
+Measured with each thread holding a constant 400 fibers, so all growth comes
+from other threads': 8 threads went from 0.38 ms to 0.29 ms per collection, and
+the curve flattened from 0.20-0.38 to 0.21-0.29. The residual growth is
+inherent without a druntime change; see `IMPROVEMENTS.md`.
+
 * *Heap growth factor is tunable and now defaults to 4* (`tgcHeapGrowth`).
   It was hardcoded at 2, which kept the heap at twice the live set and made tgc
   collect 135 times on binary-trees depth 18 where the conservative collector

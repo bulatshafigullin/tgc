@@ -140,6 +140,38 @@ tables keyed by slot would take a 16-byte object's overhead down further, at the
 cost of a lookup on the array-append path — which is hot, so this needs
 measuring before it is worth doing.
 
+### 4b. Fiber enumeration is still O(all fibers in the program)
+
+Fiber *scanning* is correctly restricted to the collecting thread's own fibers:
+a context counts as ours only if this heap owns the `StackContext` block, which
+`Fiber` allocates with `new` on its creating thread.
+
+Enumeration is not. Finding those contexts means walking druntime's global
+`ThreadBase.sm_cbeg` list, which holds every fiber in the process, and the
+ownership test has to happen *inside* druntime's thread lock — once the lock is
+released, another thread may destroy its fiber and unmap the stack, and scanning
+that faults. So each thread's collection walks T x F contexts rather than its
+own F.
+
+Measured with each thread holding a constant 400 fibers and an identical live
+set, so all growth comes from *other* threads' fibers:
+
+| threads | total fibers | collect/thread (2 walks) | (1 walk) |
+|---|---|---|---|
+| 1 | 400 | 0.20 ms | 0.21 ms |
+| 2 | 800 | 0.23 ms | 0.24 ms |
+| 4 | 1,600 | 0.27 ms | 0.27 ms |
+| 8 | 3,200 | 0.38 ms | 0.29 ms |
+
+Collapsing the count-then-filter double walk into one, with the cheap tests
+first, took the 8-thread case from 0.38 ms to 0.29 ms. The residual growth is
+inherent: the global list is the only authority on whether a fiber's stack is
+still mapped.
+
+Removing it needs druntime's help — a `ThreadBase` field recording the owning
+thread on each `StackContext`, or a per-thread context list. Either would let a
+thread enumerate only its own. Worth raising upstream alongside the tgc PR.
+
 ### 5. `GC.collect()` collects only the calling thread
 
 A user calling `GC.collect()` before a latency-critical section reclaims

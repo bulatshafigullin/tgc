@@ -2378,27 +2378,28 @@ private:
         auto lock = threadListLock();
         lock.lock_nothrow();
 
-        size_t count = 0;
-        for (auto c = globalStackContexts(); c; c = c.next)
-            count++;
-
-        if (count > heap.stackSnapCap)
-        {
-            size_t ncap = count + (count >> 1) + 8;
-            auto np = cast(RangeSnap*) cstdlib.realloc(heap.stackSnap, ncap * RangeSnap.sizeof);
-            if (!np)
-            {
-                lock.unlock_nothrow();
-                onOutOfMemoryError();
-            }
-            heap.stackSnap = np;
-            heap.stackSnapCap = ncap;
-        }
-
+        // One walk, growing the buffer as we go. The previous version walked
+        // the list twice — once to count, once to filter — which doubled the
+        // work done while holding druntime's thread lock.
+        //
+        // The ownership test has to stay inside the lock. Only once a context
+        // is known to belong to this thread is it safe to use its stack bounds
+        // later: any other thread's fiber may be destroyed and its stack
+        // unmapped the moment the lock is released, and scanning that faults.
         size_t n = 0;
-        for (auto c = globalStackContexts(); c && n < count; c = c.next)
+        for (auto c = globalStackContexts(); c; c = c.next)
         {
-            // Already covered by the active chain above.
+            // A fiber that has not started, or has finished, has
+            // tstack == bstack and contributes nothing. Cheapest test first.
+            if (!c.tstack || !c.bstack || c.tstack is c.bstack)
+                continue;
+
+            // Ours only if this heap owns the StackContext block itself —
+            // `Fiber` allocates it with `new` on its creating thread.
+            if (!heap.lookup(cast(void*) c, false).valid())
+                continue;
+
+            // Already covered by the active chain scanned by the caller.
             bool inChain = false;
             for (auto k = cur; k; k = k.within)
                 if (k is c)
@@ -2409,15 +2410,18 @@ private:
             if (inChain)
                 continue;
 
-            // A fiber that has not started, or has finished, has
-            // tstack == bstack and contributes nothing.
-            if (!c.tstack || !c.bstack || c.tstack is c.bstack)
-                continue;
-
-            // Ours only if this heap owns the StackContext block itself.
-            if (!heap.lookup(cast(void*) c, false).valid())
-                continue;
-
+            if (n == heap.stackSnapCap)
+            {
+                size_t ncap = heap.stackSnapCap ? heap.stackSnapCap * 2 : 64;
+                auto np = cast(RangeSnap*) cstdlib.realloc(heap.stackSnap, ncap * RangeSnap.sizeof);
+                if (!np)
+                {
+                    lock.unlock_nothrow();
+                    onOutOfMemoryError();
+                }
+                heap.stackSnap = np;
+                heap.stackSnapCap = ncap;
+            }
             heap.stackSnap[n++] = RangeSnap(c.tstack, c.bstack);
         }
 
