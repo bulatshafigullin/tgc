@@ -250,36 +250,36 @@ private enum size_t collectThresholdInit = 256 * 1024;
  * pauses that grow with total published allocations. A cooperative global
  * collection (Phase 2) is what would make this affordable by default.
  */
-private __gshared bool escapeTracking = false;
+private shared bool escapeTracking = false;
 
 /// Enable or disable escape promotion. See `escapeTracking`.
 extern (C) void tgc_setTrackEscapes(bool enable) nothrow @nogc
 {
-    escapeTracking = enable;
+    atomicStore(escapeTracking, enable);
 }
 
 /// ditto
 extern (C) bool tgc_getTrackEscapes() nothrow @nogc
 {
-    return escapeTracking;
+    return atomicLoad(escapeTracking);
 }
 
 /// Retained bytes at which a global collection is triggered; 0 disables it.
 extern (C) void tgc_setGlobalThreshold(size_t bytes) nothrow @nogc
 {
-    globalThreshold = bytes;
+    atomicStore(globalThreshold, bytes);
 }
 
 /// ditto
 extern (C) size_t tgc_getGlobalThreshold() nothrow @nogc
 {
-    return globalThreshold;
+    return atomicLoad(globalThreshold);
 }
 
 /// Bytes held in arenas adopted from exited threads, reclaimable only globally.
 extern (C) size_t tgc_getRetainedBytes() nothrow @nogc
 {
-    return orphanBytes;
+    return atomicLoad(orphanBytes);
 }
 
 /// Maps a request size to a size-class index.
@@ -641,12 +641,6 @@ private struct ThreadHeap
     size_t collectThreshold = collectThresholdInit;
     size_t numCollections;
 
-    // Remote frees pushed by other threads (ownership transfer).
-    void** remotePtrs;
-    size_t remoteLen;
-    size_t remoteCap;
-    SpinLock remoteLock;
-
     // Explicit mark worklist. The previous rescan-until-stable fixpoint walked
     // the whole heap once per pointer-graph level; a worklist scans each live
     // block exactly once.
@@ -677,7 +671,6 @@ private struct ThreadHeap
         if (!h)
             onOutOfMemoryError();
         h.collectThreshold = collectThresholdInit;
-        h.remoteLock = SpinLock(SpinLock.Contention.brief);
         return h;
     }
 
@@ -686,12 +679,10 @@ private struct ThreadHeap
         // The rt.tlsgc handle is owned by druntime, not by us; destroying it
         // here would double-free the thread's TLS ranges.
         map.destroy();
-        cstdlib.free(remotePtrs);
         cstdlib.free(markStack);
         cstdlib.free(rootSnap);
         cstdlib.free(rangeSnap);
         cstdlib.free(stackSnap);
-        remotePtrs = null;
         markStack = null;
         rootSnap = null;
         rangeSnap = null;
@@ -975,46 +966,6 @@ private struct ThreadHeap
         freeSlot(b);
     }
 
-    // -- remote free queue --------------------------------------------------
-
-    void pushRemote(void* p) nothrow @nogc
-    {
-        remoteLock.lock();
-        if (remoteLen == remoteCap)
-        {
-            size_t ncap = remoteCap ? remoteCap * 2 : 16;
-            auto np = cast(void**) cstdlib.realloc(remotePtrs, ncap * (void*).sizeof);
-            if (!np)
-            {
-                remoteLock.unlock();
-                onOutOfMemoryError();
-            }
-            remotePtrs = np;
-            remoteCap = ncap;
-        }
-        remotePtrs[remoteLen++] = p;
-        remoteLock.unlock();
-    }
-
-    void drainRemote() nothrow @nogc
-    {
-        remoteLock.lock();
-        size_t n = remoteLen;
-        void** ptrs = remotePtrs;
-        remoteLen = 0;
-        remoteLock.unlock();
-
-        foreach (i; 0 .. n)
-        {
-            auto p = ptrs[i];
-            if (!p)
-                continue;
-            auto b = lookup(p, false);
-            if (b.valid())
-                freeSlot(b);
-        }
-    }
-
     // -- mark worklist ------------------------------------------------------
 
     void pushMark(void* base, size_t size) nothrow @nogc
@@ -1093,7 +1044,7 @@ private __gshared ThreadHeap* orphanHeap;
 private __gshared SpinLock orphanLock;
 
 /// Bytes held in arenas adopted from exited threads. Drives the global-collection trigger.
-private __gshared size_t orphanBytes;
+private shared size_t orphanBytes;
 
 private void adoptOrphanChunks(ThreadHeap* dying) nothrow @nogc
 {
@@ -1132,7 +1083,7 @@ private void adoptOrphanChunks(ThreadHeap* dying) nothrow @nogc
             orphanHeap.map.put(cast(void*)(raw + i * chunkSize), c);
 
         orphanHeap.reservedBytes += c.runChunks * chunkSize;
-        orphanBytes += c.runChunks * chunkSize;
+        atomicOp!"+="(orphanBytes, c.runChunks * chunkSize);
         orphanHeap.usedBytes += c.isLarge()
             ? c.largeSize
             : (c.slotCount - c.freeCount) * c.slotSize;
@@ -1164,6 +1115,8 @@ private void adoptOrphanChunks(ThreadHeap* dying) nothrow @nogc
  * suspends threads registered with the runtime.
  */
 
+// Touched only by the thread that won the globalPending CAS, so no further
+// synchronisation is needed on these.
 private __gshared ChunkMap globalMap;
 private __gshared MarkItem* globalMarkStack;
 private __gshared size_t globalMarkLen;
@@ -1173,7 +1126,7 @@ private shared bool globalPending;
 private shared int activeLocalCollections;
 
 /// Retained bytes at which a global collection is triggered. 0 disables it.
-private __gshared size_t globalThreshold = 64 * 1024 * 1024;
+private shared size_t globalThreshold = 64 * 1024 * 1024;
 
 private void pushGlobalMark(void* base, size_t size) nothrow @nogc
 {
@@ -1410,7 +1363,7 @@ private void sweepOrphanHeap() nothrow
     }
     h.finalizing = false;
 
-    orphanBytes = h.reservedBytes;
+    atomicStore(orphanBytes, h.reservedBytes);
 }
 
 private ThreadHeap* currentHeap() nothrow @nogc
@@ -1514,7 +1467,6 @@ class ThreadGC : GC
     void minimize() nothrow
     {
         auto heap = currentHeap();
-        heap.drainRemote();
 
         // Hand back every chunk that holds no live slot.
         auto c = heap.allChunks;
@@ -1643,15 +1595,10 @@ class ThreadGC : GC
             return;
         auto owner = b.chunk.heap;
         if (owner.isOrphan)
-            return; // adopted from a dead thread; retained, never reused
-        auto local = tlsHeap;
-        if (owner is local || local is null)
-        {
-            owner.freeSlot(b);
-            return;
-        }
-        // Cross-thread free: queue for owning thread (ownership transfer).
-        owner.pushRemote(p);
+            return; // adopted from a dead thread; only a global collection frees it
+        // queryBlock only ever resolves blocks in this thread's heap or the
+        // orphan heap, so the owner is always this thread here.
+        owner.freeSlot(b);
     }
 
     void* addrOf(void* p) nothrow @nogc
@@ -1937,8 +1884,6 @@ class ThreadGC : GC
         // being torn down.
         unregisterHeap(h);
 
-        h.drainRemote();
-
         // Do NOT finalize or release the thread's blocks here. Thread.join()
         // hands the child's Throwable to the parent after this point, so doing
         // either is a use-after-free in ordinary code. Move the arenas to the
@@ -1976,28 +1921,26 @@ private:
             if (b.valid())
                 return b;
         }
-        // Slow path: search registered heaps (for free/query of foreign ptrs)
-        heapsLock.lock();
-        foreach (i; 0 .. allHeapsLen)
-        {
-            if (allHeaps[i] is tlsHeap)
-                continue;
-            auto b = allHeaps[i].lookup(p, false);
-            if (b.valid())
-            {
-                heapsLock.unlock();
-                return b;
-            }
-        }
-        heapsLock.unlock();
+        // Arenas adopted from exited threads. Safe to probe because no thread
+        // owns the orphan heap: it is mutated only under orphanLock.
+        //
+        // Another *live* thread's heap is deliberately not searched. Its owner
+        // mutates its chunk map with no lock at all -- and ChunkMap.grow frees
+        // the old key and value arrays -- so probing it from here was a genuine
+        // use-after-free, reachable from an ordinary GC.sizeOf on a pointer
+        // this thread does not own. Cross-thread sharing is unsupported, so
+        // there is nothing to find there anyway.
+        orphanLock.lock();
+        scope (exit)
+            orphanLock.unlock();
+        if (orphanHeap !is null)
+            return orphanHeap.lookup(p, false);
         return BlkRef.init;
     }
 
     BlkRef alloc(size_t size, uint bits, bool zero, const TypeInfo ti) nothrow
     {
         auto heap = currentHeap();
-        heap.drainRemote();
-
         if (atomicLoad(disabled) <= 0 && heap.usedBytes >= heap.collectThreshold)
         {
             collectHeap(heap, Trigger.automatic);
@@ -2006,8 +1949,8 @@ private:
             // escape tracking is on -- can only be reclaimed globally. Check
             // after a local collection rather than on every allocation, so the
             // cost is amortised and the world stops rarely.
-            auto threshold = globalThreshold;
-            if (threshold != 0 && orphanBytes >= threshold
+            auto threshold = atomicLoad(globalThreshold);
+            if (threshold != 0 && atomicLoad(orphanBytes) >= threshold
                 && !heap.collecting && !heap.finalizing)
                 collectGlobal(this);
         }
@@ -2059,11 +2002,10 @@ private:
         auto started = MonoTime.currTime;
 
         heap.collecting = true;
-        heap.drainRemote();
 
         heap.markLen = 0;
 
-        immutable bool trackEscapes = escapeTracking;
+        immutable bool trackEscapes = atomicLoad(escapeTracking);
 
         // Clear this cycle's marks. With escape tracking on, also re-seed every
         // already-promoted block as a root: a promoted block may be unreachable

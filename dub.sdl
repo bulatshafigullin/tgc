@@ -25,3 +25,21 @@ configuration "unittest" {
 buildType "unittest-optimized" {
     buildOptions "unittests" "optimize" "inline" "debugInfo"
 }
+
+// Sanitizer builds (LDC only). `dub test --dflags=...` is not a thing, so the
+// flags live here where they can be checked in.
+//
+// TgcSanitize scales the test suites' iteration counts down: sanitizers
+// instrument every load, and a conservative collector scanning whole stacks is
+// close to their worst case.
+buildType "unittest-tsan" {
+    buildOptions "unittests" "debugInfo"
+    dflags "-fsanitize=thread"
+    versions "TgcSanitize"
+}
+
+buildType "unittest-asan" {
+    buildOptions "unittests" "debugInfo"
+    dflags "-fsanitize=address"
+    versions "TgcSanitize"
+}

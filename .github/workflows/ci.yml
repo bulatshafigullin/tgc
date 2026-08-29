@@ -67,17 +67,30 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sanitizer: [address, thread]
+        include:
+          - sanitizer: thread
+            build: unittest-tsan
+          - sanitizer: address
+            build: unittest-asan
     steps:
       - uses: actions/checkout@v4
       - uses: dlang-community/setup-dlang@v1
         with:
           compiler: ldc-latest
-      # A garbage collector is exactly the code sanitizers are for: use-after-free
-      # from over-eager sweeping, and races on cross-thread heap access.
+      # A garbage collector is exactly the code sanitizers are for: races on
+      # cross-thread heap access, and use-after-free from over-eager sweeping.
+      #
+      # NOTE: neither sanitizer has ever been run against this project. Both
+      # runtimes are broken for D on the machine it was developed on -- ASan
+      # deadlocks inside its own startup and TSan segfaults, both reproducible
+      # with a printf("hello") containing none of this code -- so this job is
+      # their first real execution. Expect it to need tuning rather than to be
+      # green on day one.
+      #
+      # The flags live in dub.sdl build types because `dub test --dflags=...`
+      # is not accepted by dub.
       - name: Test under -fsanitize=${{ matrix.sanitizer }}
         env:
-          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
-          TSAN_OPTIONS: halt_on_error=1
-        run: dub test --compiler=ldc2 --build=unittest --d-version=TgcSanitize
-             --dflags=-fsanitize=${{ matrix.sanitizer }} --dflags=-g
+          ASAN_OPTIONS: detect_leaks=0:detect_stack_use_after_return=0
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+        run: dub test --compiler=ldc2 --build=${{ matrix.build }}

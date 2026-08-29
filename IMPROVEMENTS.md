@@ -169,39 +169,48 @@ of blocks with known pointer maps would cut both false retention and mark time.
 The instance is `malloc`'d and `emplace`'d; `roots`/`ranges` leak at shutdown.
 Harmless in practice, untidy.
 
-### 10. Sanitizers have never actually run — CI will be their first execution
+### 10. Sanitizers still have not run — CI remains their first execution
 
-The ASan and TSan jobs are wired up and target `ubuntu-latest`, but **neither
-has been run successfully**, because both sanitizer runtimes are broken on the
-development machine (macOS 15.5 / arm64, LDC 1.42):
+Both runtimes are broken for D on the development machine (macOS 15.5 / arm64,
+LDC 1.42). ASan deadlocks inside its own startup; TSan segfaults before `main`.
+Both were confirmed against controls containing none of this project's code:
 
-* ASan deadlocks during its own startup, before `main`. A sampled stack shows
-  `AsanInitInternal` → `InitializeShadowMemory` → `MemoryRangeIsAvailable` →
-  `get_dyld_hdr` → recursive `malloc` → spin on ASan's init mutex.
-* TSan segfaults on startup.
+* a `printf("hello")` D program fails identically under each;
+* the same program **in C**, built with clang, runs fine under both;
+* even `-betterC` (no druntime at all) segfaults under TSan.
 
-Both were confirmed with a `printf("hello")` control program containing none of
-this project's code, so the failures are in the sanitizer runtimes, not in tgc.
+So the fault is in LDC's sanitizer support on this platform, not in tgc or in
+druntime. The CI jobs target `ubuntu-latest` and will be the first real
+execution.
 
-Two changes were made in anticipation of the Linux runs, and both are correct
-regardless: the mark routines carry `@noSanitize("address")` (conservative
-scanning reads padding, redzones and quarantined memory *by design*, so those
-reads are not bugs), and the test suite scales its iteration counts down under
-`version(TgcSanitize)`.
+Two concrete things were fixed while trying:
 
-Treat the first CI sanitizer run as an experiment that will probably need
-tuning, not as a green check that already passed.
+* **The CI sanitizer job could never have worked.** It passed `--dflags=...`
+  to `dub test`, which dub rejects outright (`Unknown command line flags`). The
+  flags now live in `unittest-tsan` / `unittest-asan` build types in `dub.sdl`,
+  both verified to compile and link against the real sanitizer runtimes.
+* **The audit a sanitizer would have done was done by hand**, which found a real
+  data race — see below.
 
-Local memory-safety confidence instead comes from `test/tgc_stress.d`, which
-gives every block a checkable fill pattern and hammers size-class edges, the
-small/large chunk transition, chunk release and reuse, explicit free, realloc
-across boundaries, concurrent churn, and repeated thread creation/teardown.
-Two real bugs were found and fixed by review and testing during this work:
+Expect the first CI sanitizer run to need tuning rather than to be green.
 
-* a use-after-free in the sweep — freeing the single slot of a large chunk
-  releases the chunk, after which the loop was still reading `c.slotCount` and
-  `c.freeCount` out of the freed header;
-* a finalizer that allocates could be handed a slot from the chunk currently
-  being swept, at an index the sweep had not yet reached, and the sweep would
-  then immediately free the object it had just handed out. Fixed by allocating
-  black while a collection is in flight.
+### 11. One race is fixed by inspection, not by a reproducing test
+
+`queryBlock` used to probe every other live thread's `ChunkMap` under
+`heapsLock`, while those maps are mutated by their owners under no lock at all
+— and `ChunkMap.grow` frees the old key and value arrays. That is a concurrent
+read of freed memory, reachable from an ordinary `GC.sizeOf` on a pointer the
+calling thread does not own. It is fixed: the fallback now searches only the
+orphan heap, which is mutated exclusively under `orphanLock`.
+
+It resisted every attempt to reproduce, including a build with a 200 µs delay
+inserted into `ChunkMap.grow` and 400,000 concurrent cross-heap queries. That is
+the expected shape: a reader of a just-freed malloc block usually gets
+stale-but-plausible data rather than a fault, so the failure is a wrong answer,
+not a crash. `test/tgc_race.d` exercises the path hard but does **not** detect
+the original bug — verified by running it against the pre-fix commit, where it
+passes 30/30.
+
+This is exactly the class of defect a thread sanitizer finds by happens-before
+analysis and stress testing does not. Treat it as the strongest argument for
+getting item 10 working.

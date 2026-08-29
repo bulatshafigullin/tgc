@@ -189,6 +189,33 @@ fiber-to-thread affinity, so narrowing this needs tgc-side tracking.
   fibers, whether this heap owns the `StackContext` block that `Fiber` allocates
   with `new` on its creating thread.
 
+* *Removed a cross-thread data race in `queryBlock`.* Looking up a pointer this
+  thread does not own used to probe every other live thread's chunk map under
+  `heapsLock`, while those maps are mutated by their owners under no lock at all
+  -- and `ChunkMap.grow` frees the old key and value arrays. That is a
+  concurrent read of freed memory, reachable from an ordinary `GC.sizeOf`. The
+  fallback now searches only the orphan heap, which is mutated exclusively under
+  `orphanLock`; another live thread's heap is never touched.
++
+Found by inspection, not by a test. It resisted reproduction even with a 200 us
+delay injected into `ChunkMap.grow` and 400,000 concurrent cross-heap queries,
+because a reader of a just-freed malloc block usually gets stale-but-plausible
+data rather than a fault. `test/tgc_race.d` covers the path but does not detect
+the original bug -- confirmed by running it against the pre-fix commit.
+
+* *Removed the remote free queue.* With the cross-heap lookup gone, `free()` can
+  no longer resolve another live thread's block, so the queue was unreachable
+  code that implied a supported ownership-transfer path. Removing it also drops
+  a call from every allocation.
+
+* Cross-thread tuning state (`escapeTracking`, `globalThreshold`,
+  `orphanBytes`) is now atomic; it was plain `__gshared` read and written from
+  several threads.
+
+* Fixed the CI sanitizer job, which could never have run: it passed
+  `--dflags=...` to `dub test`, which dub rejects. The flags now live in
+  `unittest-tsan` and `unittest-asan` build types.
+
 === Fixed — found during this work
 
 * Use-after-free in the sweep: freeing the single slot of a large chunk
