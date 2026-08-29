@@ -180,6 +180,16 @@ normally does. Do not build shared config on a worker that later exits.
 
 ---
 
+## 3a. Leave escape tracking off
+
+`tgcTrackEscapes(true)` makes tgc retain anything it has seen reachable from a
+global, which closes a cross-thread hole. Do not enable it in a server: the
+retained set is re-scanned on every collection and never shrinks, so pause time
+grows for the life of the process — the opposite of what you are here for.
+
+The architecture in §1 and §2 is what makes it unnecessary. Nothing crosses
+threads, so there is nothing to promote.
+
 ## 4. Per-request allocation: play to tgc's strength
 
 The reason to want tgc here is tail latency: a collection pauses one thread's

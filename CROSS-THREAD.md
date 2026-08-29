@@ -209,6 +209,29 @@ language change.
 promotion were re-evaluated per cycle, A would reclaim X while B holds it. Once
 promoted, always promoted — only a cooperative global collection may free it.
 
+**Promotion is sampled, and that leaves a residual hole.** This corrects a claim
+made earlier in this note. A block is promoted when *a collection observes it*
+reachable from a global. If a block is published, grabbed by another thread, and
+unpublished entirely between two collections, no collection ever sees it global
+and it is never promoted — so the original use-after-free remains possible in
+that window. Closing it completely needs a write barrier on stores of GC
+pointers into globals, which D does not have and which would cost far more than
+this collector saves.
+
+What the sampled rule does cover:
+
+* **The druntime holes of §2.** A `Thread` object, its closure and a propagated
+  `Throwable` all hang off the global thread list for their entire lifetime, not
+  for a window, so any collection during that lifetime promotes them. (§2.2 is
+  additionally covered outright by Phase 0, which stops releasing a dead
+  thread's arenas at all.)
+* **Long-lived published state** — configuration, registries, caches, service
+  singletons. These are global across many collections.
+
+What it does not cover is a short-lived publish/unpublish handshake used to move
+ownership between threads. Programs doing that should pass a value or an `fd`
+rather than a GC pointer (see `WEBSERVER.md` §1), or wait for Phase 2.
+
 This is what a druntime maintainer proposed in the announcement thread:
 
 > Have a thread local scanner and heap. Once the stack, TLS, and heap reachable
@@ -243,11 +266,41 @@ process exits, and its objects are never finalized. That is fine for a fixed
 worker pool and bad for a program that spawns many short-lived threads. Phase 2
 is what makes it reclaimable.
 
-**Phase 1 — sticky promotion on global reachability.**
-Add a per-slot `shared` bit. Mark in two passes: first from global ranges,
-tagging everything transitively reached as shared; then from stack/TLS/registers
-as normal. A thread-local sweep frees only unmarked, unpromoted slots. Promoted
-slots and orphaned arenas accumulate.
+**Phase 1 — sticky promotion on global reachability. DONE, but opt-in.**
+A per-slot `slotShared` bit, never cleared. Marking runs in two passes: first the
+closure reachable from global roots, tagging everything it reaches as promoted;
+then this thread's stack, registers and TLS. Already-promoted blocks are re-seeded
+as roots each cycle, because a promoted block may be unreachable from anything
+the owning thread can see while another thread still holds it — without that,
+its children (which may never have been global themselves) would be swept out
+from under that thread. The sweep frees only slots that are neither marked nor
+promoted.
+
+Enable with `tgcTrackEscapes(true)`; **off by default**, and the measurement is
+why. Because promotion is sticky the promoted set never shrinks, and it must be
+re-seeded as roots on every subsequent collection. On a workload that publishes
+and drops 50,000 objects repeatedly, the mark phase grew as the promoted set
+grew:
+
+| promoted blocks | mark phase |
+|---|---|
+| 43,000 | 0.25 ms |
+| 100,000 | 0.46 ms |
+| 152,000 | 1.64 ms |
+| 212,000 | 3.66 ms |
+
+and it would keep growing for the life of the process. For a collector whose
+entire value is bounded pause time, pauses that grow with everything the program
+has ever published is a worse failure than the narrow bug promotion fixes — so
+the caller chooses. With it off there is no measurable cost (collection times
+are unchanged within run-to-run variance).
+
+Turn it on if the program hands GC pointers to other threads through globals and
+can afford that growth. Phase 2 is what would make it cheap enough to default
+on, because a global collection can finally reclaim promoted blocks.
+
+Also subject to the sampling limitation above: promotion only sees blocks that
+are globally reachable *at the moment some collection runs*.
 
 **Phase 2 — cooperative global collection.**
 Rare, triggered by shared-heap growth. Needs every thread to publish its roots;

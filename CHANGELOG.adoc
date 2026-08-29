@@ -86,6 +86,27 @@ Scaling is now linear rather than quadratic.
 * Pause time is measured: `profileStats()` reports `totalPauseTime` and
   `maxPauseTime`. `profilePauseTicks` was declared and never written.
 
+=== Added
+
+* `tgcTrackEscapes(bool)` — opt-in escape promotion. A block observed reachable
+  from a global root is promoted and never reclaimed by a thread-local
+  collection, which closes the case of a block published to a global, picked up
+  by another thread, then unpublished. Promotion is transitive and sticky, and
+  already-promoted blocks are re-seeded as roots each cycle so their children
+  are not swept out from under the thread holding them.
++
+**Off by default.** Because the promoted set never shrinks it must be
+re-scanned every cycle; on a workload publishing and dropping 50,000 objects
+repeatedly the mark phase grew from 0.25 ms to 3.66 ms as the set reached
+212,000 blocks, and would keep growing. For a collector whose value is bounded
+pause time that is a worse failure than the bug it fixes, so the caller decides.
+With it off, collection times are unchanged.
++
+Two limits remain, both documented in `CROSS-THREAD.md`: promotion is *sampled*
+at collection time, so a block published and unpublished entirely between two
+collections is never seen; and promoted blocks accumulate until a cooperative
+global collection exists to reclaim them.
+
 === Infrastructure
 
 * Converted `AGENTS.md`, `README.adoc`, `LICENSE`, `.gitignore`,

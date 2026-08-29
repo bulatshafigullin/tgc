@@ -49,10 +49,15 @@ the root tables are snapshotted rather than held locked for the duration.
 
 * *Cross-thread sharing is unsupported in v1.* A block handed to another thread
   is still owned by the allocating thread's heap, and that heap's collector
-  never scans the other thread's stack — so the block can be swept while still
-  in use. Use `immutable` or copied message passing. This is not yet enforced
-  at runtime; see link:CROSS-THREAD.md[CROSS-THREAD.md] for why D's type system
-  cannot resolve it at allocation time, and what can.
+  never scans the other thread's stack, so the block can be swept while still in
+  use. Prefer `immutable` or copied message passing.
++
+`tgcTrackEscapes(true)` opts into retaining anything seen reachable from a
+global, which covers the common publish-to-a-global handoff. It is off by
+default: the retained set never shrinks and is re-scanned every cycle, so pauses
+grow with everything the program has ever published. See
+link:CROSS-THREAD.md[CROSS-THREAD.md] for why D's type system cannot settle this
+at allocation time, and what can.
 * *A thread's memory is not reclaimed when it exits.* Its arenas are retained,
   because `Thread.join()` hands the parent objects the child allocated. Suited
   to a fixed worker pool; unsuitable for programs spawning many short-lived

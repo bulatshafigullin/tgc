@@ -50,10 +50,23 @@ Quadratic → linear. Appending 100,000 elements: 100,000 reallocations → 13.
 > at allocation time (the spec blesses `cast(shared)` on thread-local data), but
 > collection-time escape detection can.
 >
-> **Phase 0 is done**: a dying thread's arenas are retained rather than
-> finalized and freed, which closes the `join()` use-after-free. Phases 1 and 2
-> (sticky promotion on global reachability, then cooperative global collection)
-> remain open, and are what the rest of this item is about.
+> **Phases 0 and 1 are done**: a dying thread's arenas are retained rather than
+> finalized and freed (closing the `join()` use-after-free), and blocks observed
+> reachable from a global root are stickily promoted and never reclaimed by a
+> thread-local sweep.
+>
+> Phase 1 ships **off by default** (`tgcTrackEscapes(true)` enables it),
+> because the promoted set is sticky and must be re-scanned every cycle:
+> measured, the mark phase grew from 0.25 ms to 3.66 ms as the promoted set
+> grew to 212,000 blocks, and it keeps growing. Unbounded pause growth is a
+> worse failure than the bug it fixes for this collector's audience.
+>
+> Two things remain. Promotion is *sampled* at collection time, so a block
+> published, shared and unpublished entirely between two collections is never
+> seen and is still vulnerable; closing that needs a write barrier D does not
+> have. And promoted blocks accumulate, because only a cooperative global
+> collection (Phase 2) can prove no thread holds them — which is also what
+> would let Phase 1 be the default.
 
 This is the one item from the audit deliberately **not** fixed, because it is a
 design decision rather than a bug fix.
@@ -89,13 +102,21 @@ reachable and untested — is the worst of the three.
 
 ## Open — smaller items
 
-### 2. Dead threads' memory is never reclaimed (Phase 0's accepted cost)
+### 2. Promoted blocks and dead threads' arenas are never reclaimed
 
-Adopted arenas are retained until the process exits and their objects are never
-finalized. Fine for a fixed worker pool; bad for a program that spawns many
-short-lived threads, where it is an unbounded leak. Phase 2's cooperative global
-collection is what makes those arenas reclaimable — until then this is a real
-constraint on which programs should select tgc.
+Two sources of permanent retention, both resolved by the same missing piece
+(Phase 2, a cooperative global collection):
+
+* Arenas adopted from exited threads are retained until the process exits and
+  their objects are never finalized.
+* With `tgcTrackEscapes(true)`, any block ever observed reachable from a global
+  root is promoted and never reclaimed by a thread-local sweep — and, worse than
+  a plain leak, it is re-scanned on every subsequent collection, so pause time
+  grows monotonically. This is why the option defaults to off.
+
+Fine for a fixed worker pool with mostly-static global state; a growing leak for
+a program that churns globals or spawns many short-lived threads. This is a real
+constraint on which programs should select tgc today.
 
 ### 3. Every thread scans every other thread's fibers
 

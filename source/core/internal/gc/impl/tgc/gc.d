@@ -199,6 +199,38 @@ private enum size_t numClasses = sizeClasses.length;
 
 private enum size_t collectThresholdInit = 256 * 1024;
 
+/**
+ * Whether to promote blocks observed reachable from a global root.
+ *
+ * Off by default, deliberately. Promotion closes a real hole — a block
+ * published to a global, picked up by another thread, then unpublished would
+ * otherwise be reclaimed while that other thread still held it — but promotion
+ * is sticky, so the promoted set never shrinks and is re-scanned on every
+ * subsequent collection. Measured on a workload that publishes and drops
+ * 50,000 objects repeatedly, the mark phase grew from 0.25 ms to 3.66 ms as the
+ * promoted set grew to 212,000 blocks, and it would keep growing.
+ *
+ * For a collector whose whole purpose is bounded pause time, monotonically
+ * growing pauses are a worse failure than the narrow bug this fixes, so the
+ * caller decides. Turn it on with `tgcTrackEscapes(true)` if the program
+ * publishes GC pointers to globals for other threads to pick up and can afford
+ * pauses that grow with total published allocations. A cooperative global
+ * collection (Phase 2) is what would make this affordable by default.
+ */
+private __gshared bool escapeTracking = false;
+
+/// Enable or disable escape promotion. See `escapeTracking`.
+extern (C) void tgc_setTrackEscapes(bool enable) nothrow @nogc
+{
+    escapeTracking = enable;
+}
+
+/// ditto
+extern (C) bool tgc_getTrackEscapes() nothrow @nogc
+{
+    return escapeTracking;
+}
+
 /// Maps a request size to a size-class index.
 private uint classOf(size_t size) nothrow @nogc
 {
@@ -260,6 +292,18 @@ else
 
 private enum uint slotAllocated = 1 << 0;
 private enum uint slotMarked = 1 << 1;
+
+/**
+ * The block has been reachable from a global root at least once, so another
+ * thread may hold a reference to it.
+ *
+ * Sticky: never cleared once set. Consider thread A allocating X, publishing it
+ * in a `shared` global, thread B reading the global and keeping X only on B's
+ * stack, and A then clearing the global. X is now reachable from nothing A can
+ * see, but B is still using it. Re-deciding this each cycle would free X; only
+ * a permanent mark is safe.
+ */
+private enum uint slotShared = 1 << 2;
 
 private struct SlotMeta
 {
@@ -560,6 +604,8 @@ private struct ThreadHeap
 
     bool collecting;
     bool finalizing;
+    /// True while marking the closure reachable from global roots.
+    bool markAsShared;
     /// Set on the single heap that adopts dead threads' arenas. Never collected.
     bool isOrphan;
 
@@ -1651,26 +1697,48 @@ private:
         heap.collecting = true;
         heap.drainRemote();
 
-        // Clear marks
-        for (auto c = heap.allChunks; c; c = c.nextAll)
-            foreach (idx; 0 .. c.slotCount)
-                c.meta[idx].flags &= ~slotMarked;
-
         heap.markLen = 0;
 
-        // Mark from this thread's stack and callee-saved registers. The shell
-        // spills the registers so they land in the scanned range; no other
-        // thread is suspended.
+        immutable bool trackEscapes = escapeTracking;
+
+        // Clear this cycle's marks. With escape tracking on, also re-seed every
+        // already-promoted block as a root: a promoted block may be unreachable
+        // from anything this thread can see while another thread still holds
+        // it, so it must be scanned, or its children -- which may never have
+        // been global themselves -- would be swept out from under that thread.
+        for (auto c = heap.allChunks; c; c = c.nextAll)
+        {
+            foreach (idx; 0 .. c.slotCount)
+            {
+                auto m = &c.meta[idx];
+                m.flags &= ~slotMarked;
+                if (!trackEscapes)
+                    continue;
+                if (!(m.flags & slotAllocated) || !(m.flags & slotShared))
+                    continue;
+                m.flags |= slotMarked;
+                if (!(m.attr & BlkAttr.NO_SCAN))
+                    heap.pushMark(c.slotAt(idx), c.capacity());
+            }
+        }
+
+        if (trackEscapes)
+        {
+            // Compute the closure reachable from global roots first and to
+            // completion, so everything it reaches can be tagged as escaped.
+            heap.markAsShared = true;
+            markRootsAndRanges(heap);
+            drainMarkStack(heap);
+            heap.markAsShared = false;
+        }
+
+        // This thread's own roots: stack and callee-saved registers (the shell
+        // spills them into the scanned range), then TLS. No other thread is
+        // suspended.
         callWithStackShell((void* sp) nothrow { markStacks(heap, sp); });
-
-        // Mark from this thread's TLS.
         markTLS(heap);
-
-        // Mark from global roots/ranges.
-        markRootsAndRanges(heap);
-
-        // Transitive closure over the worklist. Each live block is scanned
-        // exactly once, rather than the whole heap once per graph level.
+        if (!trackEscapes)
+            markRootsAndRanges(heap);
         drainMarkStack(heap);
 
         // Sweep unmarked
@@ -1688,7 +1756,10 @@ private:
             foreach (idx; 0 .. count)
             {
                 auto m = &c.meta[idx];
-                if ((m.flags & slotAllocated) && !(m.flags & slotMarked))
+                // slotShared blocks are never reclaimed by a thread-local
+                // collection; only a cooperative global collection can prove
+                // no other thread still holds them.
+                if ((m.flags & slotAllocated) && !(m.flags & (slotMarked | slotShared)))
                 {
                     heap.freeSlotFinalize(BlkRef(c, idx));
                     if (large)
@@ -1924,6 +1995,10 @@ private:
         if (m.flags & slotMarked)
             return;
         m.flags |= slotMarked;
+        // The global closure is computed first and to completion, so anything
+        // marked during that pass is reachable from a global and gets promoted.
+        if (heap.markAsShared)
+            m.flags |= slotShared;
         if (!(m.attr & BlkAttr.NO_SCAN))
             heap.pushMark(b.payload(), b.capacity());
     }
