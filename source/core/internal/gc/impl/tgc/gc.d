@@ -42,6 +42,20 @@ extern (C) void rt_finalizeFromGC(void* p, size_t size, uint attr, const(TypeInf
 extern (C) void* thread_stackTop() nothrow @nogc;
 extern (C) void* thread_stackBottom() nothrow @nogc;
 
+// Used only by the cooperative global collection; a thread-local collection
+// never suspends anybody.
+alias ScanAllThreadsFn = void delegate(void* pbeg, void* pend) nothrow;
+extern (C) void thread_suspendAll() nothrow;
+extern (C) void thread_resumeAll() nothrow;
+extern (C) void thread_scanAll(scope ScanAllThreadsFn scan) nothrow;
+
+private void thread_yield() nothrow
+{
+    import core.thread.osthread : Thread;
+
+    Thread.yield();
+}
+
 private
 {
     alias ScanDg = void delegate(void* pstart, void* pend) nothrow;
@@ -112,6 +126,25 @@ private auto threadListLock() nothrow @nogc
         static assert(false,
             "tgc: cannot reach druntime's thread-list lock (ThreadBase.slock), " ~
             "needed to snapshot the stack-context list safely.");
+}
+
+/**
+ * Head of this thread's active stack-context chain (`ThreadBase.m_curr`).
+ *
+ * The chain links the running context to the ones it is nested inside, so from
+ * inside a fiber it yields that fiber and then the thread's own stack.
+ */
+private StackContext* currentStackContext(ThreadBase t) nothrow @nogc
+{
+    if (t is null)
+        return null;
+    static if (__traits(compiles, __traits(getMember, ThreadBase.init, "m_curr")))
+        return cast(StackContext*) __traits(getMember, t, "m_curr");
+    else
+        static assert(false,
+            "tgc: cannot reach druntime's current stack context " ~
+            "(ThreadBase.m_curr), needed to identify which stacks belong to " ~
+            "this thread.");
 }
 
 /**
@@ -229,6 +262,24 @@ extern (C) void tgc_setTrackEscapes(bool enable) nothrow @nogc
 extern (C) bool tgc_getTrackEscapes() nothrow @nogc
 {
     return escapeTracking;
+}
+
+/// Retained bytes at which a global collection is triggered; 0 disables it.
+extern (C) void tgc_setGlobalThreshold(size_t bytes) nothrow @nogc
+{
+    globalThreshold = bytes;
+}
+
+/// ditto
+extern (C) size_t tgc_getGlobalThreshold() nothrow @nogc
+{
+    return globalThreshold;
+}
+
+/// Bytes held in arenas adopted from exited threads, reclaimable only globally.
+extern (C) size_t tgc_getRetainedBytes() nothrow @nogc
+{
+    return orphanBytes;
 }
 
 /// Maps a request size to a size-class index.
@@ -535,6 +586,17 @@ private struct ChunkMap
             }
             i = (i + 1) & mask;
         }
+    }
+
+    /// Drop every entry but keep the allocation, for repeated rebuilds.
+    void clearEntries() nothrow @nogc
+    {
+        if (keys)
+            memset(keys, 0, cap * (void*).sizeof);
+        if (vals)
+            memset(vals, 0, cap * (Chunk*).sizeof);
+        len = 0;
+        occupied = 0;
     }
 
     void destroy() nothrow @nogc
@@ -1030,6 +1092,9 @@ private void unregisterHeap(ThreadHeap* h) nothrow @nogc
 private __gshared ThreadHeap* orphanHeap;
 private __gshared SpinLock orphanLock;
 
+/// Bytes held in arenas adopted from exited threads. Drives the global-collection trigger.
+private __gshared size_t orphanBytes;
+
 private void adoptOrphanChunks(ThreadHeap* dying) nothrow @nogc
 {
     if (dying.allChunks is null)
@@ -1067,6 +1132,7 @@ private void adoptOrphanChunks(ThreadHeap* dying) nothrow @nogc
             orphanHeap.map.put(cast(void*)(raw + i * chunkSize), c);
 
         orphanHeap.reservedBytes += c.runChunks * chunkSize;
+        orphanBytes += c.runChunks * chunkSize;
         orphanHeap.usedBytes += c.isLarge()
             ? c.largeSize
             : (c.slotCount - c.freeCount) * c.slotSize;
@@ -1076,6 +1142,275 @@ private void adoptOrphanChunks(ThreadHeap* dying) nothrow @nogc
 
     dying.allChunks = null;
     orphanLock.unlock();
+}
+
+// ---------------------------------------------------------------------------
+// cooperative global collection
+// ---------------------------------------------------------------------------
+
+/*
+ * A thread-local collection can never reclaim two things: arenas adopted from
+ * exited threads, and blocks promoted because they escaped through a global.
+ * Neither can be proven dead without knowing what every thread holds, so both
+ * accumulate for the life of the process.
+ *
+ * The global collection is the answer, and it is the one operation in tgc that
+ * does stop the world. That is the deal Milewski's original sketch of the
+ * scheme described -- per-thread heaps collect independently, and "only
+ * occasional collection of the shared heap would require the cooperation of all
+ * threads". It is rare and triggered by retained bytes, not by allocation rate.
+ *
+ * Detached @nogc threads are still never paused: thread_suspendAll only
+ * suspends threads registered with the runtime.
+ */
+
+private __gshared ChunkMap globalMap;
+private __gshared MarkItem* globalMarkStack;
+private __gshared size_t globalMarkLen;
+private __gshared size_t globalMarkCap;
+
+private shared bool globalPending;
+private shared int activeLocalCollections;
+
+/// Retained bytes at which a global collection is triggered. 0 disables it.
+private __gshared size_t globalThreshold = 64 * 1024 * 1024;
+
+private void pushGlobalMark(void* base, size_t size) nothrow @nogc
+{
+    if (globalMarkLen == globalMarkCap)
+    {
+        size_t ncap = globalMarkCap ? globalMarkCap * 2 : 1024;
+        auto np = cast(MarkItem*) cstdlib.realloc(globalMarkStack, ncap * MarkItem.sizeof);
+        if (!np)
+            onOutOfMemoryError();
+        globalMarkStack = np;
+        globalMarkCap = ncap;
+    }
+    globalMarkStack[globalMarkLen++] = MarkItem(base, size);
+}
+
+@conservativeScan
+private void markPtrGlobal(void* p) nothrow
+{
+    if (!p)
+        return;
+    auto c = globalMap.get(cast(void*)(cast(size_t) p & chunkMask));
+    if (!c)
+    {
+        c = globalMap.get(cast(void*)(((cast(size_t) p) - 1) & chunkMask));
+        if (!c)
+            return;
+    }
+
+    size_t idx;
+    if (c.isLarge())
+    {
+        auto base = c.data;
+        auto end = cast(void*)(cast(ubyte*) base + c.largeSize);
+        if (p < base || p > end)
+            return;
+        idx = 0;
+    }
+    else
+    {
+        if (p < c.data)
+            return;
+        size_t off = cast(ubyte*) p - cast(ubyte*) c.data;
+        idx = off / c.slotSize;
+        if (idx >= c.slotCount)
+        {
+            if (idx != c.slotCount || off % c.slotSize != 0)
+                return;
+            idx = c.slotCount - 1;
+        }
+        else if (off % c.slotSize == 0 && idx > 0
+                 && !(c.meta[idx].flags & slotAllocated)
+                 && (c.meta[idx - 1].flags & slotAllocated))
+        {
+            idx--;
+        }
+    }
+
+    auto m = &c.meta[idx];
+    if (!(m.flags & slotAllocated) || (m.flags & slotMarked))
+        return;
+    m.flags |= slotMarked;
+    if (!(m.attr & BlkAttr.NO_SCAN))
+        pushGlobalMark(c.slotAt(idx), c.capacity());
+}
+
+@conservativeScan
+private void markRangeGlobal(void* pbot, void* ptop) nothrow
+{
+    if (!pbot || !ptop || pbot >= ptop)
+        return;
+    auto addr = (cast(size_t) pbot + (void*).sizeof - 1) & ~((void*).sizeof - 1);
+    auto p = cast(void**) addr;
+    auto e = cast(void**) ptop;
+    for (; p + 1 <= e; ++p)
+        markPtrGlobal(*p);
+}
+
+@conservativeScan
+private void drainGlobalMark() nothrow
+{
+    while (globalMarkLen)
+    {
+        auto item = globalMarkStack[--globalMarkLen];
+        markRangeGlobal(item.base, cast(void*)(cast(ubyte*) item.base + item.size));
+    }
+}
+
+/**
+ * Reclaim everything a thread-local collection cannot: adopted arenas and
+ * promoted blocks.
+ *
+ * Returns false if another global collection is already running, in which case
+ * this one is simply skipped.
+ */
+private bool collectGlobal(ThreadGC gc) nothrow
+{
+    import core.atomic : cas;
+
+    // A collection already running on this thread has its own entry in
+    // activeLocalCollections, so proceeding here would wait for ourselves. This
+    // happens for real: a finalizer running during the sweep may allocate,
+    // which re-enters alloc and reaches the trigger below.
+    if (tlsHeap !is null && (tlsHeap.collecting || tlsHeap.finalizing))
+        return false;
+    if (ThreadBase.getThis() is null)
+        return false;
+
+    // One at a time.
+    if (!cas(&globalPending, false, true))
+        return false;
+    scope (exit)
+        atomicStore(globalPending, false);
+
+    // Wait for in-flight thread-local collections to finish. A local collection
+    // owns its heap's mark bits, so suspending one mid-mark and then rewriting
+    // those bits here would corrupt both.
+    while (atomicLoad(activeLocalCollections) != 0)
+        thread_yield();
+
+    // Taken before suspending, so no thread can be suspended midway through
+    // mutating the heap registry. Never the other way round.
+    heapsLock.lock();
+    scope (exit)
+        heapsLock.unlock();
+
+    // The world is stopped for MARKING ONLY. Sweeping here would be unsafe:
+    // running a finalizer with threads suspended can block on a lock one of
+    // them holds, and freeing into a live thread's heap races that thread the
+    // moment it resumes. druntime's own collector resumes before sweeping for
+    // the same reason.
+    {
+        thread_suspendAll();
+        scope (exit)
+            thread_resumeAll();
+
+        // Index every chunk of every heap, including the orphan heap, so a
+        // candidate pointer costs one probe instead of one per heap.
+        globalMap.clearEntries();
+        globalMarkLen = 0;
+        foreach (i; 0 .. allHeapsLen)
+        {
+            auto h = allHeaps[i];
+            for (auto c = h.allChunks; c; c = c.nextAll)
+            {
+                auto raw = cast(ubyte*) c;
+                foreach (k; 0 .. c.runChunks)
+                    globalMap.put(cast(void*)(raw + k * chunkSize), c);
+                foreach (idx; 0 .. c.slotCount)
+                    c.meta[idx].flags &= ~slotMarked;
+            }
+        }
+
+        // Every thread's stack, fibers, saved registers and TLS. This is the
+        // traversal the stop-the-world collector performs, and it is only
+        // valid with the world stopped.
+        thread_scanAll((void* pbeg, void* pend) nothrow { markRangeGlobal(pbeg, pend); });
+        drainGlobalMark();
+
+        gc.markGlobalRootsAndRanges();
+        drainGlobalMark();
+
+        // Demote promoted blocks the global mark proved unreachable. Only flag
+        // manipulation happens here -- no allocation, no finalizers, no frees
+        // -- so it is safe with the world stopped. Their owning threads then
+        // reclaim them on their own next local collection, on their own
+        // thread, running their finalizers normally.
+        foreach (i; 0 .. allHeapsLen)
+        {
+            auto h = allHeaps[i];
+            if (h.isOrphan)
+                continue;
+            for (auto c = h.allChunks; c; c = c.nextAll)
+                foreach (idx; 0 .. c.slotCount)
+                {
+                    auto m = &c.meta[idx];
+                    if ((m.flags & slotAllocated) && !(m.flags & slotMarked))
+                        m.flags &= ~slotShared;
+                }
+        }
+    }
+
+    // World resumed. The orphan heap is owned by no thread, so it can be swept
+    // now, with finalizers running normally. Its mark bits are untouched by
+    // anyone else in the meantime.
+    sweepOrphanHeap();
+
+    orphanBytes = orphanHeap is null ? 0 : orphanHeap.reservedBytes;
+    return true;
+}
+
+/**
+ * Reclaim dead blocks in arenas adopted from exited threads.
+ *
+ * Runs after the world has resumed, using the mark bits the global collection
+ * computed. Nothing else touches the orphan heap: no thread owns it, a second
+ * global collection is excluded by `globalPending`, and adoption takes
+ * `orphanLock`.
+ */
+private void sweepOrphanHeap() nothrow
+{
+    orphanLock.lock();
+    scope (exit)
+        orphanLock.unlock();
+
+    auto h = orphanHeap;
+    if (h is null)
+        return;
+
+    h.finalizing = true;
+    auto c = h.allChunks;
+    while (c)
+    {
+        auto nextChunk = c.nextAll;
+        immutable bool large = c.isLarge();
+        immutable uint count = c.slotCount;
+        bool released = false;
+
+        foreach (idx; 0 .. count)
+        {
+            auto m = &c.meta[idx];
+            if (!(m.flags & slotAllocated) || (m.flags & slotMarked))
+                continue;
+            h.freeSlotFinalize(BlkRef(c, idx));
+            if (large)
+            {
+                released = true;
+                break;
+            }
+        }
+
+        if (!released && !large && c.freeCount == c.slotCount)
+            h.releaseChunk(c);
+        c = nextChunk;
+    }
+    h.finalizing = false;
+
+    orphanBytes = h.reservedBytes;
 }
 
 private ThreadHeap* currentHeap() nothrow @nogc
@@ -1167,6 +1502,13 @@ class ThreadGC : GC
         // An explicit GC.collect() must run even while disabled; disable()
         // suppresses only allocation-triggered collections.
         collectHeap(currentHeap(), Trigger.explicit);
+    }
+
+    /// Run a cooperative global collection now. Returns false if one was
+    /// already in progress.
+    bool collectGlobalNow() nothrow
+    {
+        return collectGlobal(this);
     }
 
     void minimize() nothrow
@@ -1657,7 +1999,18 @@ private:
         heap.drainRemote();
 
         if (atomicLoad(disabled) <= 0 && heap.usedBytes >= heap.collectThreshold)
+        {
             collectHeap(heap, Trigger.automatic);
+
+            // Retained memory -- adopted arenas, and promoted blocks when
+            // escape tracking is on -- can only be reclaimed globally. Check
+            // after a local collection rather than on every allocation, so the
+            // cost is amortised and the world stops rarely.
+            auto threshold = globalThreshold;
+            if (threshold != 0 && orphanBytes >= threshold
+                && !heap.collecting && !heap.finalizing)
+                collectGlobal(this);
+        }
 
         auto b = heap.allocSlot(size);
         auto m = b.meta();
@@ -1691,6 +2044,17 @@ private:
         // Refuse to collect rather than free something still in use.
         if (ThreadBase.getThis() is null)
             return;
+
+        // Publish that a local collection is in flight so a global collection
+        // waits for it rather than suspending this thread mid-mark.
+        atomicOp!"+="(activeLocalCollections, 1);
+        if (atomicLoad(globalPending))
+        {
+            atomicOp!"-="(activeLocalCollections, 1);
+            return;
+        }
+        scope (exit)
+            atomicOp!"-="(activeLocalCollections, 1);
 
         auto started = MonoTime.currTime;
 
@@ -1819,9 +2183,9 @@ private:
     }
 
     /**
-     * Scan every stack that could hold a reference into this heap.
+     * Scan every stack belonging to this thread.
      *
-     * Scanning only the running stack is not enough once fibers exist.
+     * Scanning only the running stack is not enough once fibers exist:
      * `thread_stackBottom()` reports the *current* `StackContext`, so a
      * collection triggered inside a fiber would scan that fiber and nothing
      * else — not the thread's own stack, and not any other fiber parked on a
@@ -1829,38 +2193,51 @@ private:
      * inside a fiber, so that is the common case, and every suspended fiber's
      * live data would be freed underneath it.
      *
-     * druntime registers every stack — thread stacks and fiber stacks alike —
-     * on the global `ThreadBase.sm_cbeg` list, which is what the stop-the-world
-     * collector walks. We walk the same list. Only the *used* span
-     * `[tstack, bstack)` of each context is scanned, so an idle fiber costs the
-     * few hundred bytes it is actually using rather than its whole reserved
-     * stack.
+     * Only *this thread's* contexts are scanned. Walking druntime's global
+     * context list wholesale is both wasteful (a thread has no business
+     * marking through another thread's stack, since it can only mark blocks in
+     * its own heap) and unsafe: another thread may destroy a fiber and unmap
+     * its stack while we are reading it, which faults.
+     *
+     * Ownership is established two ways. The active chain from `m_curr` gives
+     * the running context and everything it is nested inside, which is how the
+     * thread's own stack is reached from inside a fiber. Suspended fibers are
+     * not in any chain, but `Fiber` allocates its `StackContext` with `new` on
+     * the creating thread's heap, so a context whose block this heap owns is a
+     * fiber this thread created.
      */
     @conservativeScan
     void markStacks(ThreadHeap* heap, void* sp) nothrow
     {
-        // The running context is the only one whose saved `tstack` is stale,
-        // so scan it precisely from the stack pointer the register-spill shell
-        // handed us.
-        auto curBottom = thread_stackBottom();
-        markStackSpan(heap, sp, curBottom);
+        auto t = ThreadBase.getThis();
+        auto cur = currentStackContext(t);
 
-        // Snapshot the remaining contexts, then scan outside the lock. Holding
-        // druntime's thread lock across the mark would block every thread
-        // creating a fiber or a thread for the duration of a collection.
-        size_t n = snapshotStackContexts(heap, curBottom);
+        // The running context is the only one whose saved `tstack` is stale, so
+        // scan it precisely from the stack pointer the register-spill shell
+        // handed us.
+        markStackSpan(heap, sp, cur !is null ? cur.bstack : thread_stackBottom());
+
+        // Contexts the running one is nested inside: from within a fiber this
+        // is the thread's own stack.
+        for (auto c = (cur !is null ? cur.within : null); c; c = c.within)
+            markStackSpan(heap, c.tstack, c.bstack);
+
+        // Fibers this thread created that are currently suspended.
+        size_t n = snapshotOwnedContexts(heap, cur);
         foreach (i; 0 .. n)
             markStackSpan(heap, heap.stackSnap[i].pbot, heap.stackSnap[i].ptop);
     }
 
     /**
-     * Copy the used span of every registered stack context except the running
-     * one into the heap's scratch buffer, under druntime's thread lock.
+     * Copy the used span of every suspended fiber this thread owns into the
+     * heap's scratch buffer, under druntime's thread lock.
      *
-     * Taking `slock` here follows druntime's documented lock order (the GC lock
-     * is acquired before it, never after), so it cannot invert.
+     * Taking `slock` follows druntime's documented lock order (the GC lock is
+     * acquired before it, never after), so it cannot invert. Holding it only
+     * for the snapshot keeps a collection from blocking fiber creation for the
+     * whole mark.
      */
-    size_t snapshotStackContexts(ThreadHeap* heap, void* curBottom) nothrow
+    size_t snapshotOwnedContexts(ThreadHeap* heap, StackContext* cur) nothrow
     {
         auto lock = threadListLock();
         lock.lock_nothrow();
@@ -1885,14 +2262,26 @@ private:
         size_t n = 0;
         for (auto c = globalStackContexts(); c && n < count; c = c.next)
         {
-            // Skip the running context: handled precisely above, and its
-            // recorded tstack is stale while it executes.
-            if (c.bstack is curBottom)
+            // Already covered by the active chain above.
+            bool inChain = false;
+            for (auto k = cur; k; k = k.within)
+                if (k is c)
+                {
+                    inChain = true;
+                    break;
+                }
+            if (inChain)
                 continue;
-            // A fiber that has not started, or has finished, has tstack ==
-            // bstack and contributes nothing.
+
+            // A fiber that has not started, or has finished, has
+            // tstack == bstack and contributes nothing.
             if (!c.tstack || !c.bstack || c.tstack is c.bstack)
                 continue;
+
+            // Ours only if this heap owns the StackContext block itself.
+            if (!heap.lookup(cast(void*) c, false).valid())
+                continue;
+
             heap.stackSnap[n++] = RangeSnap(c.tstack, c.bstack);
         }
 
@@ -1969,6 +2358,17 @@ private:
     }
 
     @conservativeScan
+    /// Mark the shared root tables into the global collection's mark set.
+    package void markGlobalRootsAndRanges() nothrow
+    {
+        // The world is stopped, so rootsLock must not be taken: the thread
+        // holding it may be suspended.
+        foreach (i; 0 .. roots.length)
+            markPtrGlobal(roots[i].proot);
+        foreach (i; 0 .. ranges.length)
+            markRangeGlobal(ranges[i].pbot, ranges[i].ptop);
+    }
+
     void markRange(ThreadHeap* heap, void* pbot, void* ptop) nothrow
     {
         if (!pbot || !ptop || pbot >= ptop)

@@ -190,6 +190,19 @@ grows for the life of the process — the opposite of what you are here for.
 The architecture in §1 and §2 is what makes it unnecessary. Nothing crosses
 threads, so there is nothing to promote.
 
+## 3b. Global collection: rare, short, and worth tuning
+
+Threads that exit leave their arenas behind, because `Thread.join()` may still
+hand the parent objects they allocated. A global collection reclaims them; it is
+the one operation that stops the world, and it stops it for marking only —
+measured at 0.07 ms to reclaim 2 MB of arenas from eight exited threads.
+
+For a server this mostly does not matter, because a worker pool is created once
+and its threads live for the process lifetime, so almost nothing is ever
+adopted. If you *do* churn threads, tune `tgcGlobalThreshold` — lower means more
+frequent, shorter stops; `0` disables the automatic trigger entirely so you can
+call `tgcCollectGlobal()` yourself at a quiet moment.
+
 ## 4. Per-request allocation: play to tgc's strength
 
 The reason to want tgc here is tail latency: a collection pauses one thread's

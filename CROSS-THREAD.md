@@ -302,11 +302,31 @@ on, because a global collection can finally reclaim promoted blocks.
 Also subject to the sampling limitation above: promotion only sees blocks that
 are globally reachable *at the moment some collection runs*.
 
-**Phase 2 — cooperative global collection.**
-Rare, triggered by shared-heap growth. Needs every thread to publish its roots;
-can use a handshake at allocation safepoints rather than `thread_suspendAll`, so
-detached `@nogc` threads still never get paused — which is the project's actual
-selling point, and it survives intact.
+**Phase 2 — cooperative global collection. DONE.**
+`tgcCollectGlobal()`, and automatic once retained bytes pass
+`tgcGlobalThreshold` (64 MiB by default). This is the one tgc operation that
+stops the world, and it does so **for marking only**:
+
+1. Wait for in-flight thread-local collections — a local collection owns its
+   heap's mark bits, and suspending one mid-mark would corrupt them.
+2. `thread_suspendAll`, then index every chunk of every heap into one map and
+   mark from `thread_scanAll` (all stacks, fibers, saved registers, TLS) plus
+   the global root tables.
+3. Still stopped, but only touching flags: demote promoted blocks the mark
+   proved unreachable.
+4. `thread_resumeAll`.
+5. Sweep the orphan heap, which no thread owns, with finalizers running
+   normally. Demoted blocks are reclaimed by their owning thread's next local
+   collection, on that thread, running their finalizers there.
+
+Sweeping *inside* the stop was the first attempt and was wrong twice over: a
+finalizer running with threads suspended can block on a lock one of them holds,
+and freeing into a live thread's heap races that thread the moment it resumes.
+druntime's own collector resumes before sweeping for exactly these reasons.
+
+Measured: reclaiming 2 MB of arenas from eight exited threads takes a **0.07 ms**
+world-stop. Detached `@nogc` threads are still never paused — `thread_suspendAll`
+only suspends threads registered with the runtime.
 
 **Phase 3 (optional, upstream) — `BlkAttr.SHARED` as a hint.**
 Forward `is(T == shared) || is(T == immutable)` from `_d_newclassT`/`_d_newitemT`

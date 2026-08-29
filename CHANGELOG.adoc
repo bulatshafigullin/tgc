@@ -88,6 +88,29 @@ Scaling is now linear rather than quadratic.
 
 === Added
 
+* `tgcCollectGlobal()` and `tgcGlobalThreshold(size_t)` — cooperative global
+  collection, the only thing that can reclaim memory a thread-local collection
+  cannot prove dead: arenas adopted from exited threads, and blocks promoted by
+  escape tracking. Runs automatically once retained bytes pass the threshold
+  (64 MiB by default; 0 disables it). `tgcRetainedBytes()` reports the figure it
+  triggers on.
++
+This is the one tgc operation that stops the world, and it stops it **for
+marking only**: suspend, index every heap's chunks, mark from `thread_scanAll`
+plus the global root tables, demote promoted blocks the mark proved unreachable,
+resume. Reclamation happens afterwards -- the orphan heap is swept directly
+since no thread owns it, and demoted blocks are freed by their owning thread's
+next local collection, on that thread, so their finalizers run there.
++
+Sweeping inside the stop was the first attempt and was wrong twice over: a
+finalizer running with threads suspended can block on a lock one of them holds,
+and freeing into a live thread's heap races that thread the moment it resumes.
+Both showed up as intermittent failures before the restructure.
++
+Measured: reclaiming 2 MB of arenas from eight exited threads takes a 0.07 ms
+world-stop. Detached `@nogc` threads are still never paused, since
+`thread_suspendAll` only suspends threads registered with the runtime.
+
 * `tgcTrackEscapes(bool)` — opt-in escape promotion. A block observed reachable
   from a global root is promoted and never reclaimed by a thread-local
   collection, which closes the case of a block published to a global, picked up
@@ -156,6 +179,15 @@ Measured cost, 50,000 live objects:
 About 0.32 µs per suspended fiber. Known limitation: the context list is global,
 so every thread scans every other thread's fibers. druntime records no
 fiber-to-thread affinity, so narrowing this needs tgc-side tracking.
+
+* *Fiber scanning is restricted to the collecting thread's own stacks.* Walking
+  druntime's global context list wholesale could fault: another thread may
+  destroy a fiber and unmap its stack while we read it, which showed up as an
+  intermittent segfault in the multi-threaded fiber test. It was also wasteful,
+  since a thread can only mark blocks in its own heap. A thread's own contexts
+  are now identified by the active `m_curr`/`within` chain plus, for suspended
+  fibers, whether this heap owns the `StackContext` block that `Fiber` allocates
+  with `new` on its creating thread.
 
 === Fixed — found during this work
 

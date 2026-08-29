@@ -27,6 +27,58 @@ bool tgcTrackEscapes() nothrow @nogc
     return tgc_getTrackEscapes();
 }
 
+/**
+ * Run a cooperative global collection now.
+ *
+ * This is the one tgc operation that stops the world, and the only way to
+ * reclaim memory a thread-local collection cannot prove dead: arenas adopted
+ * from exited threads, and blocks promoted by `tgcTrackEscapes`. It is
+ * otherwise triggered automatically once retained bytes pass
+ * `tgcGlobalThreshold`.
+ *
+ * Detached `@nogc` threads are not paused: only threads registered with the
+ * runtime are suspended.
+ *
+ * Returns: false if a global collection was already in progress.
+ */
+bool tgcCollectGlobal()
+{
+    import core.internal.gc.proxy : gc_getProxy;
+
+    if (auto g = cast(ThreadGC) gc_getProxy())
+        return g.collectGlobalNow();
+    return false;
+}
+
+/**
+ * Retained bytes at which a global collection triggers automatically.
+ *
+ * Defaults to 64 MiB. Set to 0 to disable automatic global collection, in which
+ * case retained memory grows until `tgcCollectGlobal` is called explicitly.
+ */
+void tgcGlobalThreshold(size_t bytes) nothrow @nogc
+{
+    tgc_setGlobalThreshold(bytes);
+}
+
+/// ditto
+size_t tgcGlobalThreshold() nothrow @nogc
+{
+    return tgc_getGlobalThreshold();
+}
+
+/**
+ * Bytes held in arenas adopted from threads that have exited.
+ *
+ * A thread-local collection cannot prove these dead, so they accumulate until a
+ * global collection runs. Use this to decide when to call `tgcCollectGlobal`,
+ * or to check that the automatic threshold is doing its job.
+ */
+size_t tgcRetainedBytes() nothrow @nogc
+{
+    return tgc_getRetainedBytes();
+}
+
 version (Tgc_default)
 {
     extern (C) __gshared string[] rt_options = [ "gcopt=gc:tgc" ];

@@ -58,10 +58,13 @@ default: the retained set never shrinks and is re-scanned every cycle, so pauses
 grow with everything the program has ever published. See
 link:CROSS-THREAD.md[CROSS-THREAD.md] for why D's type system cannot settle this
 at allocation time, and what can.
-* *A thread's memory is not reclaimed when it exits.* Its arenas are retained,
-  because `Thread.join()` hands the parent objects the child allocated. Suited
-  to a fixed worker pool; unsuitable for programs spawning many short-lived
-  threads.
+* *A thread's memory is not reclaimed when it exits* by a thread-local
+  collection, because `Thread.join()` hands the parent objects the child
+  allocated. It is reclaimed by the next global collection, which runs
+  automatically once retained bytes pass `tgcGlobalThreshold` (64 MiB), or on
+  demand via `tgcCollectGlobal()`. That is the only tgc operation that stops the
+  world; it stops it for marking only, measured at 0.07 ms for 2 MB of adopted
+  arenas.
 * `GC.collect()` collects only the calling thread's heap. A thread that never
   allocates never collects.
 * Marking is conservative; no precise scanning or moving/compaction.

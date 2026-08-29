@@ -55,7 +55,11 @@ Quadratic → linear. Appending 100,000 elements: 100,000 reallocations → 13.
 > reachable from a global root are stickily promoted and never reclaimed by a
 > thread-local sweep.
 >
-> Phase 1 ships **off by default** (`tgcTrackEscapes(true)` enables it),
+> **Phase 2 is done**: `tgcCollectGlobal()` reclaims adopted arenas and demotes
+> promoted blocks, with a measured 0.07 ms world-stop for marking only. That
+> removes the permanent-retention objection to both Phase 0 and Phase 1.
+>
+> Phase 1 still ships **off by default** (`tgcTrackEscapes(true)` enables it),
 > because the promoted set is sticky and must be re-scanned every cycle:
 > measured, the mark phase grew from 0.25 ms to 3.66 ms as the promoted set
 > grew to 212,000 blocks, and it keeps growing. Unbounded pause growth is a
@@ -102,21 +106,17 @@ reachable and untested — is the worst of the three.
 
 ## Open — smaller items
 
-### 2. Promoted blocks and dead threads' arenas are never reclaimed
+### 2. Escape tracking still defaults to off
 
-Two sources of permanent retention, both resolved by the same missing piece
-(Phase 2, a cooperative global collection):
+Phase 2 reclaims both adopted arenas and promoted blocks, so retention is no
+longer permanent. But `tgcTrackEscapes` remains opt-in, because between global
+collections the promoted set is still re-scanned on every local collection, so
+pauses still grow with published allocations — just boundedly now, reset by each
+global collection.
 
-* Arenas adopted from exited threads are retained until the process exits and
-  their objects are never finalized.
-* With `tgcTrackEscapes(true)`, any block ever observed reachable from a global
-  root is promoted and never reclaimed by a thread-local sweep — and, worse than
-  a plain leak, it is re-scanned on every subsequent collection, so pause time
-  grows monotonically. This is why the option defaults to off.
-
-Fine for a fixed worker pool with mostly-static global state; a growing leak for
-a program that churns globals or spawns many short-lived threads. This is a real
-constraint on which programs should select tgc today.
+Making it the default would mean tying local pause time to the global-collection
+interval, which needs measurement on a realistic workload first. Worth
+revisiting.
 
 ### 3. Every thread scans every other thread's fibers
 
