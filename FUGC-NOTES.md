@@ -56,45 +56,61 @@ them. tgc already reclaims eagerly on `GC.free`, so this one is covered.
 
 ---
 
-## Applicable, not yet done
+### Bitvector marks
 
-### Soft handshakes instead of stop-the-world
+FUGC spends under 5% of its time sweeping because its marks are bitvectors it
+can scan with SIMD. tgc kept `allocated`/`marked`/`shared` inside a 24-byte
+`SlotMeta` per slot, so clearing every mark meant a read-modify-write across all
+of it, and the sweep touched 24 bytes to read one bit.
 
-This is the most valuable idea for tgc. FUGC never stops the world; it uses
-*soft handshakes* — the collector asks each thread to do something (typically
-"scan your own stack") and each thread does it at its own next safepoint,
-asynchronously. The only pause any thread sees is its own callback, bounded by
-its own stack height.
+Those three states now live in per-chunk bitvectors and attributes in a byte
+array. Clearing marks is a `memset` over n/8 bytes; the sweep tests
+`allocated & ~marked & ~shared` 64 slots per word, so mostly-live and
+mostly-free chunks are skipped in a few instructions.
 
-tgc's global collection currently calls `thread_suspendAll`. Measured at 0.07 ms
-it is not a crisis, but it scales with total live data across all threads and it
-contradicts the project's headline claim more than it needs to.
+| arena bytes per object | before | after |
+|---|---|---|
+| 16-byte objects | 48.50 | 41.94 |
+| 32-byte objects | 64.55 | 58.00 |
+| 64-byte objects | 96.67 | 90.11 |
 
-The port is plausible because tgc already has a natural poll site that D
-otherwise lacks: **allocation**. There are no compiler-emitted pollchecks in D,
-but `alloc` already tests flags on every call, and a thread that is allocating is
-exactly a thread whose roots need re-scanning.
+Per-slot metadata fell from 24 bytes to 17.375. Collection *time* is unchanged
+(256k live objects: 1.83 ms), which is itself informative: phase timing shows
+marking dominates at roughly 90%, and sweeping was already only about 4%. The
+SIMD-sweep win FUGC reports does not transfer to a collector whose bottleneck is
+conservative marking — the payoff here is density, not speed.
 
-Sketch: publish a handshake epoch; each thread, at its next allocation, scans its
-own stack/TLS into a shared mark set and acknowledges. The collector waits for
-all acknowledgements, then sweeps the orphan heap.
+## Not portable, and it is worth being precise about why
 
-The catch FUGC solves with *enter/exit*: a thread blocked in a syscall never
-reaches a safepoint, so the collector runs the callback on its behalf. druntime
-has no such protocol — but a blocked thread's stack is quiescent, so a practical
-hybrid is: soft-handshake with a deadline, then individually suspend only the
-threads that did not answer. Most threads never pause; stragglers pause alone.
+### Soft handshakes — this corrects an earlier claim in this document
 
-### Bitvector marks and SIMD sweep
+An earlier draft listed soft handshakes as "the most valuable idea for tgc" and
+sketched an implementation. That was wrong, and in tension with this document's
+own conclusion about the store barrier two sections down.
 
-FUGC spends under 5% of its time sweeping, thanks to bitvector marks over a
-`verse_heap` layout. tgc stores a `uint flags` inside a 24-byte `SlotMeta` per
-slot, so sweeping touches 24 bytes per slot to read one bit, and the metadata
-itself is 150% overhead on a 16-byte slot (open item 4).
+A soft handshake lets each thread scan its own roots *at its own convenience*,
+which means mutators keep running between one thread's scan and another's. That
+is only sound because FUGC has a Dijkstra store barrier catching a mutator that
+moves a reference from an unscanned location into an already-scanned one.
 
-Moving `allocated`/`marked`/`shared` into per-chunk bitvectors would let the
-sweep skip 64 slots with one word test, and shrink `SlotMeta` to the fields that
-are actually per-object (`ti`, `usedSize`, `attr`). Both problems, one change.
+Without a barrier the hole is concrete. Thread A handshakes and is marked done.
+A then reads orphan block `O` out of global `G` onto its stack and clears `G`.
+The collector scans globals afterwards, finds nothing, and frees `O` while A is
+using it. Rescanning stacks to a fixpoint does not save it either: A can drop
+`O` from its stack into an already-scanned heap object.
+
+So handshake-based marking requires the barrier, exactly as concurrent marking
+does. What remains possible is a *ragged stop* — ask threads to park themselves
+at their next allocation instead of signalling them — but every thread still has
+to be stopped simultaneously for the mark, so it is not a soft handshake, and
+threads that park early wait longer than they do under `thread_suspendAll`. For
+a fibre server where many threads are blocked on I/O and never reach an
+allocation, the suspend fallback would dominate and there would be no benefit at
+all.
+
+`thread_suspendAll` at a measured 0.07 ms stays.
+
+## Also not yet done
 
 ### Parallel marking
 
@@ -104,8 +120,6 @@ independently — but the global collection is single-threaded. Low priority whi
 it stays at 0.07 ms.
 
 ---
-
-## Does not transfer, and it is worth being precise about why
 
 ### The Dijkstra store barrier — and therefore concurrent marking
 
@@ -164,14 +178,15 @@ refinement, not the FUGC design.
 | Black allocation | same, arrived at independently |
 | Parallel marking | per-thread by construction; global collection is serial |
 | Concurrent / on-the-fly | **not reachable** — needs a store barrier D lacks |
-| Soft handshakes | **portable**, and the best remaining idea; `alloc` is the poll site |
-| Bitvector SIMD sweep | **portable**, and would fix the metadata overhead too |
+| Soft handshakes | **not portable** — needs the same store barrier |
+| Bitvector marks | **ported**; density win, not a speed win here |
 | Honours `free` | same |
 
 The one structural thing FUGC has that tgc cannot get is the store barrier, and
-almost everything else that distinguishes FUGC follows from it. What remains
-portable — soft handshakes and bitvector sweeping — is worth doing, and neither
-requires a language change.
+almost everything else that distinguishes FUGC follows from it — concurrency,
+on-the-fly collection, and soft handshakes all rest on it. What did transfer was
+the part that needs no barrier at all: scanning objects for what they are rather
+than for the space they occupy, and keeping mark state in bitvectors.
 
 ## Sources
 

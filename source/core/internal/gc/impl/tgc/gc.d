@@ -353,27 +353,66 @@ else
 // per-slot metadata
 // ---------------------------------------------------------------------------
 
-private enum uint slotAllocated = 1 << 0;
-private enum uint slotMarked = 1 << 1;
+private enum size_t bitsPerWord = size_t.sizeof * 8;
+
+private size_t bitWords(size_t n) nothrow @nogc
+{
+    return (n + bitsPerWord - 1) / bitsPerWord;
+}
+
+private bool testBit(const(size_t)* bits, size_t i) nothrow @nogc
+{
+    return (bits[i / bitsPerWord] & (cast(size_t) 1 << (i % bitsPerWord))) != 0;
+}
+
+private void setBit(size_t* bits, size_t i) nothrow @nogc
+{
+    bits[i / bitsPerWord] |= cast(size_t) 1 << (i % bitsPerWord);
+}
+
+private void clearBit(size_t* bits, size_t i) nothrow @nogc
+{
+    bits[i / bitsPerWord] &= ~(cast(size_t) 1 << (i % bitsPerWord));
+}
 
 /**
- * The block has been reachable from a global root at least once, so another
- * thread may hold a reference to it.
+ * Block attributes actually persisted.
  *
- * Sticky: never cleared once set. Consider thread A allocating X, publishing it
- * in a `shared` global, thread B reading the global and keeping X only on B's
- * stack, and A then clearing the global. X is now reachable from nothing A can
- * see, but B is still using it. Re-deciding this each cycle would free X; only
- * a permanent mark is safe.
+ * Stored as one byte per slot rather than a `uint`. druntime's own conservative
+ * collector keeps only the defined attribute bits too (as separate bitmaps),
+ * so nothing that matters is lost, and it keeps `SlotMeta` down to two words.
  */
-private enum uint slotShared = 1 << 2;
+private enum uint keptAttrs =
+    BlkAttr.FINALIZE | BlkAttr.NO_SCAN | BlkAttr.NO_MOVE |
+    BlkAttr.APPENDABLE | BlkAttr.NO_INTERIOR | BlkAttr.STRUCTFINAL;
 
+static assert(keptAttrs <= ubyte.max, "attribute bits no longer fit in a byte");
+
+/*
+ * `sharedBits`: the block has been reachable from a global root at least once,
+ * so another thread may hold a reference to it.
+ *
+ * Sticky: never cleared by a thread-local collection. Consider thread A
+ * allocating X, publishing it in a `shared` global, thread B reading the global
+ * and keeping X only on B's stack, and A then clearing the global. X is now
+ * reachable from nothing A can see, but B is still using it. Re-deciding this
+ * each cycle would free X; only a permanent mark is safe. A global collection
+ * can clear it, having proven no thread holds the block.
+ */
+
+/**
+ * Per-slot data that genuinely varies per object.
+ *
+ * Allocated/marked/promoted state lives in per-chunk bitvectors instead, and
+ * attributes in a byte array. That makes clearing every mark a `memset` over
+ * n/8 bytes rather than a read-modify-write across every slot's metadata, lets
+ * the sweep skip 64 slots per word test, and drops per-slot overhead from 24
+ * bytes to 17.375.
+ */
 private struct SlotMeta
 {
     TypeInfo ti;      /// type for finalization; may be null
     size_t usedSize;  /// BlkAttr.APPENDABLE used bytes (array API)
-    uint attr;
-    uint flags;
 }
 
 /**
@@ -393,6 +432,10 @@ private struct Chunk
     Chunk* prevPartial;
 
     SlotMeta* meta;
+    size_t* allocBits;  /// slot is handed out
+    size_t* markBits;   /// slot was reached this cycle
+    size_t* sharedBits; /// slot escaped through a global (sticky)
+    ubyte* attrs;       /// BlkAttr, one byte per slot
     void* data;      /// first slot
     void* freeHead;  /// intrusive free-slot list, threaded through free slots
 
@@ -419,6 +462,89 @@ private struct Chunk
     size_t capacity() const nothrow @nogc
     {
         return isLarge() ? largeSize : slotSize;
+    }
+
+    bool isAllocated(size_t i) const nothrow @nogc { return testBit(allocBits, i); }
+    bool isMarked(size_t i) const nothrow @nogc { return testBit(markBits, i); }
+    bool isShared(size_t i) const nothrow @nogc { return testBit(sharedBits, i); }
+
+    void setAllocated(size_t i) nothrow @nogc { setBit(allocBits, i); }
+    void clearAllocated(size_t i) nothrow @nogc { clearBit(allocBits, i); }
+    void setMarked(size_t i) nothrow @nogc { setBit(markBits, i); }
+    void setShared(size_t i) nothrow @nogc { setBit(sharedBits, i); }
+    void clearShared(size_t i) nothrow @nogc { clearBit(sharedBits, i); }
+
+    uint attrOf(size_t i) const nothrow @nogc { return attrs[i]; }
+    void setAttrOf(size_t i, uint a) nothrow @nogc { attrs[i] = cast(ubyte)(a & keptAttrs); }
+
+    /// Like `nextReclaimable`, but ignores promotion: a global collection has
+    /// already proven reachability, so the sticky bit must not veto it.
+    size_t nextReclaimableIgnoringShared(size_t from) const nothrow @nogc
+    {
+        immutable size_t words = bitWords(slotCount);
+        size_t w = from / bitsPerWord;
+        if (w >= words)
+            return slotCount;
+
+        size_t bits = allocBits[w] & ~markBits[w];
+        immutable size_t off = from % bitsPerWord;
+        if (off)
+            bits &= ~cast(size_t) 0 << off;
+
+        for (;;)
+        {
+            if (bits)
+            {
+                import core.bitop : bsf;
+
+                size_t idx = w * bitsPerWord + bsf(bits);
+                return idx < slotCount ? idx : slotCount;
+            }
+            if (++w >= words)
+                return slotCount;
+            bits = allocBits[w] & ~markBits[w];
+        }
+    }
+
+    /// Clear every mark in one sweep over n/8 bytes.
+    void clearMarks() nothrow @nogc
+    {
+        memset(markBits, 0, bitWords(slotCount) * size_t.sizeof);
+    }
+
+    /**
+     * Index of the next slot that is allocated but neither marked nor
+     * promoted, at or after `from`; `slotCount` when there is none.
+     *
+     * Tests 64 slots per word, so a chunk that is mostly free or mostly live
+     * is skipped in a few instructions instead of one test per slot.
+     */
+    size_t nextReclaimable(size_t from) const nothrow @nogc
+    {
+        immutable size_t words = bitWords(slotCount);
+        size_t w = from / bitsPerWord;
+        if (w >= words)
+            return slotCount;
+
+        size_t bits = allocBits[w] & ~markBits[w] & ~sharedBits[w];
+        // Mask off slots before `from` in the first word.
+        immutable size_t off = from % bitsPerWord;
+        if (off)
+            bits &= ~cast(size_t) 0 << off;
+
+        for (;;)
+        {
+            if (bits)
+            {
+                import core.bitop : bsf;
+
+                size_t idx = w * bitsPerWord + bsf(bits);
+                return idx < slotCount ? idx : slotCount;
+            }
+            if (++w >= words)
+                return slotCount;
+            bits = allocBits[w] & ~markBits[w] & ~sharedBits[w];
+        }
     }
 }
 
@@ -447,6 +573,9 @@ private struct BlkRef
     {
         return chunk.capacity();
     }
+
+    uint attr() nothrow @nogc { return chunk.attrOf(idx); }
+    void setAttr(uint a) nothrow @nogc { chunk.setAttrOf(idx, a); }
 }
 
 // ---------------------------------------------------------------------------
@@ -720,13 +849,19 @@ private struct ThreadHeap
         memset(raw, 0, Chunk.sizeof);
 
         auto c = cast(Chunk*) raw;
-        immutable size_t metaOff = alignUp(Chunk.sizeof, size_t.sizeof);
+        immutable size_t bitsOff = alignUp(Chunk.sizeof, size_t.sizeof);
 
-        // Fit as many (slot + metadata) pairs as the chunk allows.
-        size_t count = (bytes - metaOff) / (slotSize + SlotMeta.sizeof);
-        size_t dataOff;
+        // Per slot: SlotMeta, one attribute byte, and three bits of state.
+        // Solve for the count that fits, then lay the regions out in order.
+        size_t count = (bytes - bitsOff) * 8 / (slotSize * 8 + SlotMeta.sizeof * 8 + 8 + 3);
+        size_t dataOff, metaOff, attrOff, markOff, sharedOff;
         for (;;)
         {
+            immutable size_t bw = bitWords(count) * size_t.sizeof;
+            markOff = bitsOff + bw;
+            sharedOff = markOff + bw;
+            attrOff = sharedOff + bw;
+            metaOff = alignUp(attrOff + count, size_t.sizeof);
             dataOff = alignUp(metaOff + count * SlotMeta.sizeof, payloadAlign);
             if (count == 0 || dataOff + count * slotSize <= bytes)
                 break;
@@ -735,6 +870,10 @@ private struct ThreadHeap
         assert(count > 0, "tgc: chunk too small for its size class");
 
         c.heap = &this;
+        c.allocBits = cast(size_t*)(cast(ubyte*) raw + bitsOff);
+        c.markBits = cast(size_t*)(cast(ubyte*) raw + markOff);
+        c.sharedBits = cast(size_t*)(cast(ubyte*) raw + sharedOff);
+        c.attrs = cast(ubyte*)(cast(ubyte*) raw + attrOff);
         c.meta = cast(SlotMeta*)(cast(ubyte*) raw + metaOff);
         c.data = cast(void*)(cast(ubyte*) raw + dataOff);
         c.slotSize = slotSize;
@@ -743,7 +882,8 @@ private struct ThreadHeap
         c.cls = cls;
         c.runChunks = units;
 
-        memset(c.meta, 0, count * SlotMeta.sizeof);
+        // One wipe covers the bitvectors, the attribute bytes and the metadata.
+        memset(cast(ubyte*) raw + bitsOff, 0, dataOff - bitsOff);
 
         // Thread the free list through the slots themselves.
         c.freeHead = null;
@@ -764,7 +904,13 @@ private struct ThreadHeap
 
     Chunk* newLargeChunk(size_t size) nothrow @nogc
     {
-        immutable size_t metaOff = alignUp(Chunk.sizeof, size_t.sizeof);
+        // A large chunk holds exactly one slot, so one word of each bitvector
+        // and one attribute byte suffice.
+        immutable size_t bitsOff = alignUp(Chunk.sizeof, size_t.sizeof);
+        immutable size_t markOff = bitsOff + size_t.sizeof;
+        immutable size_t sharedOff = markOff + size_t.sizeof;
+        immutable size_t attrOff = sharedOff + size_t.sizeof;
+        immutable size_t metaOff = alignUp(attrOff + 1, size_t.sizeof);
         immutable size_t dataOff = alignUp(metaOff + SlotMeta.sizeof, payloadAlign);
 
         size_t bytes = dataOff + size;
@@ -779,6 +925,10 @@ private struct ThreadHeap
 
         auto c = cast(Chunk*) raw;
         c.heap = &this;
+        c.allocBits = cast(size_t*)(cast(ubyte*) raw + bitsOff);
+        c.markBits = cast(size_t*)(cast(ubyte*) raw + markOff);
+        c.sharedBits = cast(size_t*)(cast(ubyte*) raw + sharedOff);
+        c.attrs = cast(ubyte*)(cast(ubyte*) raw + attrOff);
         c.meta = cast(SlotMeta*)(cast(ubyte*) raw + metaOff);
         c.data = cast(void*)(cast(ubyte*) raw + dataOff);
         c.slotSize = 0;
@@ -893,7 +1043,7 @@ private struct ThreadHeap
                 return BlkRef.init;
             if (acceptEnd ? (p > end) : (p >= end))
                 return BlkRef.init;
-            if (!(c.meta[0].flags & slotAllocated))
+            if (!c.isAllocated(0))
                 return BlkRef.init;
             return BlkRef(c, 0);
         }
@@ -909,16 +1059,15 @@ private struct ThreadHeap
                 return BlkRef.init;
             idx = c.slotCount - 1; // exactly one past the final slot
         }
-        else if (acceptEnd && off % c.slotSize == 0 && idx > 0
-                 && !(c.meta[idx].flags & slotAllocated))
+        else if (acceptEnd && off % c.slotSize == 0 && idx > 0 && !c.isAllocated(idx))
         {
             // Slot boundary: also consider it one-past-the-end of the
             // preceding slot before giving up.
-            if (c.meta[idx - 1].flags & slotAllocated)
+            if (c.isAllocated(idx - 1))
                 idx--;
         }
 
-        if (!(c.meta[idx].flags & slotAllocated))
+        if (!c.isAllocated(idx))
             return BlkRef.init;
         return BlkRef(c, idx);
     }
@@ -932,13 +1081,14 @@ private struct ThreadHeap
         // very chunk being swept — at an index the sweep has not reached yet.
         // Without the mark bit the sweep would see it allocated-and-unmarked
         // and immediately free the object that was just handed out.
-        immutable uint birthFlags =
-            slotAllocated | ((collecting || finalizing) ? slotMarked : 0);
+        immutable bool birthMarked = collecting || finalizing;
 
         if (size > maxSmall)
         {
             auto c = newLargeChunk(size);
-            c.meta[0].flags = birthFlags;
+            c.setAllocated(0);
+            if (birthMarked)
+                c.setMarked(0);
             usedBytes += c.largeSize;
             return BlkRef(c, 0);
         }
@@ -956,7 +1106,9 @@ private struct ThreadHeap
             unlinkPartial(c);
 
         size_t idx = (cast(ubyte*) slot - cast(ubyte*) c.data) / c.slotSize;
-        c.meta[idx].flags = birthFlags;
+        c.setAllocated(idx);
+        if (birthMarked)
+            c.setMarked(idx);
         usedBytes += c.slotSize;
         return BlkRef(c, idx);
     }
@@ -965,6 +1117,9 @@ private struct ThreadHeap
     {
         auto c = b.chunk;
         c.meta[b.idx] = SlotMeta.init;
+        c.clearAllocated(b.idx);
+        c.clearShared(b.idx);
+        c.setAttrOf(b.idx, 0);
 
         if (c.isLarge())
         {
@@ -983,9 +1138,9 @@ private struct ThreadHeap
 
     void freeSlotFinalize(BlkRef b) nothrow @nogc
     {
-        auto m = b.meta();
-        if (m.attr & (BlkAttr.FINALIZE | BlkAttr.STRUCTFINAL))
-            finalizeBlock(b.payload(), b.capacity(), m.attr, m.ti);
+        immutable uint attr = b.chunk.attrOf(b.idx);
+        if (attr & (BlkAttr.FINALIZE | BlkAttr.STRUCTFINAL))
+            finalizeBlock(b.payload(), b.capacity(), attr, b.meta().ti);
         freeSlot(b);
     }
 
@@ -1200,18 +1355,16 @@ private void markPtrGlobal(void* p) nothrow
             idx = c.slotCount - 1;
         }
         else if (off % c.slotSize == 0 && idx > 0
-                 && !(c.meta[idx].flags & slotAllocated)
-                 && (c.meta[idx - 1].flags & slotAllocated))
+                 && !c.isAllocated(idx) && c.isAllocated(idx - 1))
         {
             idx--;
         }
     }
 
-    auto m = &c.meta[idx];
-    if (!(m.flags & slotAllocated) || (m.flags & slotMarked))
+    if (!c.isAllocated(idx) || c.isMarked(idx))
         return;
-    m.flags |= slotMarked;
-    if (!(m.attr & BlkAttr.NO_SCAN))
+    c.setMarked(idx);
+    if (!(c.attrOf(idx) & BlkAttr.NO_SCAN))
         pushGlobalMark(c.slotAt(idx), c.capacity());
 }
 
@@ -1297,8 +1450,7 @@ private bool collectGlobal(ThreadGC gc) nothrow
                 auto raw = cast(ubyte*) c;
                 foreach (k; 0 .. c.runChunks)
                     globalMap.put(cast(void*)(raw + k * chunkSize), c);
-                foreach (idx; 0 .. c.slotCount)
-                    c.meta[idx].flags &= ~slotMarked;
+                c.clearMarks();
             }
         }
 
@@ -1322,12 +1474,9 @@ private bool collectGlobal(ThreadGC gc) nothrow
             if (h.isOrphan)
                 continue;
             for (auto c = h.allChunks; c; c = c.nextAll)
-                foreach (idx; 0 .. c.slotCount)
-                {
-                    auto m = &c.meta[idx];
-                    if ((m.flags & slotAllocated) && !(m.flags & slotMarked))
-                        m.flags &= ~slotShared;
-                }
+                for (size_t idx = c.nextReclaimableIgnoringShared(0); idx < c.slotCount;
+                     idx = c.nextReclaimableIgnoringShared(idx + 1))
+                    c.clearShared(idx);
         }
     }
 
@@ -1367,11 +1516,9 @@ private void sweepOrphanHeap() nothrow
         immutable uint count = c.slotCount;
         bool released = false;
 
-        foreach (idx; 0 .. count)
+        for (size_t idx = c.nextReclaimableIgnoringShared(0); idx < count;
+             idx = c.nextReclaimableIgnoringShared(idx + 1))
         {
-            auto m = &c.meta[idx];
-            if (!(m.flags & slotAllocated) || (m.flags & slotMarked))
-                continue;
             h.freeSlotFinalize(BlkRef(c, idx));
             if (large)
             {
@@ -1505,7 +1652,7 @@ class ThreadGC : GC
     uint getAttr(void* p) nothrow
     {
         auto b = queryBlock(p);
-        return b.valid() ? b.meta().attr : 0;
+        return b.valid() ? b.attr() : 0;
     }
 
     uint setAttr(void* p, uint mask) nothrow
@@ -1513,8 +1660,8 @@ class ThreadGC : GC
         auto b = queryBlock(p);
         if (!b.valid())
             return 0;
-        b.meta().attr |= mask;
-        return b.meta().attr;
+        b.setAttr(b.attr() | mask);
+        return b.attr();
     }
 
     uint clrAttr(void* p, uint mask) nothrow
@@ -1522,8 +1669,8 @@ class ThreadGC : GC
         auto b = queryBlock(p);
         if (!b.valid())
             return 0;
-        b.meta().attr &= ~mask;
-        return b.meta().attr;
+        b.setAttr(b.attr() & ~mask);
+        return b.attr();
     }
 
     void* malloc(size_t size, uint bits, const TypeInfo ti) nothrow
@@ -1569,7 +1716,7 @@ class ThreadGC : GC
         if (heap !is currentHeap())
         {
             // Cannot realloc a foreign block in place; copy into the local heap.
-            auto nb = alloc(size, bits ? bits : m.attr, false, ti ? ti : m.ti);
+            auto nb = alloc(size, bits ? bits : b.attr(), false, ti ? ti : m.ti);
             auto n = size < b.capacity() ? size : b.capacity();
             memcpy(nb.payload(), p, n);
             free(p);
@@ -1581,13 +1728,13 @@ class ThreadGC : GC
             // Capacity is the slot size, so a shrink is a no-op. Rewriting a
             // stored size here would desynchronise heap.usedBytes.
             if (bits)
-                m.attr = bits;
+                b.setAttr(bits);
             if (ti)
                 m.ti = cast(TypeInfo) ti;
             return p;
         }
 
-        auto nb = alloc(size, bits ? bits : m.attr, false, ti ? ti : m.ti);
+        auto nb = alloc(size, bits ? bits : b.attr(), false, ti ? ti : m.ti);
         memcpy(nb.payload(), p, b.capacity());
         heap.freeSlot(b);
         return nb.payload();
@@ -1644,7 +1791,7 @@ class ThreadGC : GC
         BlkInfo info;
         info.base = b.payload();
         info.size = b.capacity();
-        info.attr = b.meta().attr;
+        info.attr = b.attr();
         return info;
     }
 
@@ -1777,10 +1924,9 @@ class ThreadGC : GC
 
             foreach (idx; 0 .. count)
             {
-                auto m = &c.meta[idx];
-                if (!(m.flags & slotAllocated))
+                if (!c.isAllocated(idx))
                     continue;
-                if (!(m.attr & (BlkAttr.FINALIZE | BlkAttr.STRUCTFINAL)))
+                if (!(c.attrOf(idx) & (BlkAttr.FINALIZE | BlkAttr.STRUCTFINAL)))
                     continue;
                 // The vtable pointer of a class instance points into the
                 // module's code/data; if it falls inside the segment, the
@@ -1822,10 +1968,9 @@ class ThreadGC : GC
         auto b = queryBlock(ptr);
         if (!b.valid())
             return null;
-        auto m = b.meta();
-        if (!(m.attr & BlkAttr.APPENDABLE))
+        if (!(b.attr() & BlkAttr.APPENDABLE))
             return null;
-        return b.payload()[0 .. m.usedSize];
+        return b.payload()[0 .. b.meta().usedSize];
     }
 
     bool expandArrayUsed(void[] slice, size_t newUsed, bool atomic = false) nothrow @safe
@@ -1835,7 +1980,7 @@ class ThreadGC : GC
             if (!b.valid())
                 return false;
             auto m = b.meta();
-            if (!(m.attr & BlkAttr.APPENDABLE))
+            if (!(b.attr() & BlkAttr.APPENDABLE))
                 return false;
 
             size_t offset = cast(ubyte*) slice.ptr - cast(ubyte*) b.payload();
@@ -1858,7 +2003,7 @@ class ThreadGC : GC
             if (!b.valid())
                 return cast(size_t) 0;
             auto m = b.meta();
-            if (!(m.attr & BlkAttr.APPENDABLE))
+            if (!(b.attr() & BlkAttr.APPENDABLE))
                 return cast(size_t) 0;
 
             size_t offset = cast(ubyte*) slice.ptr - cast(ubyte*) b.payload();
@@ -1878,7 +2023,7 @@ class ThreadGC : GC
         if (!b.valid())
             return false;
         auto m = b.meta();
-        if (!(m.attr & BlkAttr.APPENDABLE))
+        if (!(b.attr() & BlkAttr.APPENDABLE))
             return false;
 
         size_t offset = cast(ubyte*) slice.ptr - cast(ubyte*) b.payload();
@@ -1979,8 +2124,8 @@ private:
         }
 
         auto b = heap.allocSlot(size);
+        b.setAttr(bits);
         auto m = b.meta();
-        m.attr = bits;
         m.ti = cast(TypeInfo) ti;
         m.usedSize = (bits & BlkAttr.APPENDABLE) ? size : 0;
 
@@ -2037,16 +2182,17 @@ private:
         // been global themselves -- would be swept out from under that thread.
         for (auto c = heap.allChunks; c; c = c.nextAll)
         {
+            // One memset over n/8 bytes, rather than a read-modify-write on
+            // every slot's metadata.
+            c.clearMarks();
+            if (!trackEscapes)
+                continue;
             foreach (idx; 0 .. c.slotCount)
             {
-                auto m = &c.meta[idx];
-                m.flags &= ~slotMarked;
-                if (!trackEscapes)
+                if (!c.isAllocated(idx) || !c.isShared(idx))
                     continue;
-                if (!(m.flags & slotAllocated) || !(m.flags & slotShared))
-                    continue;
-                m.flags |= slotMarked;
-                if (!(m.attr & BlkAttr.NO_SCAN))
+                c.setMarked(idx);
+                if (!(c.attrOf(idx) & BlkAttr.NO_SCAN))
                     heap.pushMark(c.slotAt(idx), c.capacity());
             }
         }
@@ -2082,20 +2228,18 @@ private:
             immutable uint count = c.slotCount;
             bool released = false;
 
-            foreach (idx; 0 .. count)
+            // nextReclaimable tests allocated & ~marked & ~shared 64 slots at
+            // a time, so mostly-live and mostly-free chunks are skipped in a
+            // few instructions. Promoted blocks are excluded: only a global
+            // collection can prove no other thread still holds them.
+            for (size_t idx = c.nextReclaimable(0); idx < count;
+                 idx = c.nextReclaimable(idx + 1))
             {
-                auto m = &c.meta[idx];
-                // slotShared blocks are never reclaimed by a thread-local
-                // collection; only a cooperative global collection can prove
-                // no other thread still holds them.
-                if ((m.flags & slotAllocated) && !(m.flags & (slotMarked | slotShared)))
+                heap.freeSlotFinalize(BlkRef(c, idx));
+                if (large)
                 {
-                    heap.freeSlotFinalize(BlkRef(c, idx));
-                    if (large)
-                    {
-                        released = true;
-                        break;
-                    }
+                    released = true;
+                    break;
                 }
             }
 
@@ -2356,15 +2500,15 @@ private:
         auto b = heap.lookup(p, true);
         if (!b.valid())
             return;
-        auto m = b.meta();
-        if (m.flags & slotMarked)
+        auto c = b.chunk;
+        if (c.isMarked(b.idx))
             return;
-        m.flags |= slotMarked;
+        c.setMarked(b.idx);
         // The global closure is computed first and to completion, so anything
         // marked during that pass is reachable from a global and gets promoted.
         if (heap.markAsShared)
-            m.flags |= slotShared;
-        if (!(m.attr & BlkAttr.NO_SCAN))
+            c.setShared(b.idx);
+        if (!(c.attrOf(b.idx) & BlkAttr.NO_SCAN))
             heap.pushMark(b.payload(), b.capacity());
     }
 }

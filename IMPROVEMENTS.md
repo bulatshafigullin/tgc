@@ -128,30 +128,17 @@ affinity itself, which needs a hook druntime does not expose today; the
 fallback is a tgc-side registry updated when a fiber is first seen running on a
 thread.
 
-### 4. Per-slot metadata: 24 bytes, and the sweep reads all of it
+### 4. Per-slot metadata is down to 17.375 bytes; `ti` and `usedSize` remain
 
-Each slot carries a 24-byte `SlotMeta` (`TypeInfo`, `usedSize`, `attr`,
-`flags`). For a 16-byte slot that is 150% overhead, and the sweep touches all
-24 bytes per slot to read one mark bit.
+Slot state moved into per-chunk bitvectors and attributes into a byte array, so
+`SlotMeta` is now just `TypeInfo ti` and `size_t usedSize` — 24 bytes per slot
+to 17.375, measured as 48.50 to 41.94 bytes of arena per 16-byte object.
 
-FUGC spends under 5% of its time sweeping because its marks are bitvectors it
-can scan with SIMD. Moving `allocated`/`marked`/`shared` into per-chunk
-bitvectors would let the sweep skip 64 slots per word test *and* shrink
-`SlotMeta` to the genuinely per-object fields — one change, both problems. See
-`FUGC-NOTES.md`.
-
-### 4a. Global collection stops the world; soft handshakes would not
-
-`tgcCollectGlobal` uses `thread_suspendAll`. At a measured 0.07 ms this is not
-urgent, but FUGC shows the alternative: ask each thread to scan its own roots at
-its next safepoint and acknowledge, so no thread waits for any other. D has no
-compiler-emitted pollchecks, but `alloc` is a natural poll site that already
-tests flags on every call.
-
-The hard case is a thread blocked in a syscall, which never reaches a safepoint;
-FUGC solves it with an enter/exit protocol druntime lacks. A practical hybrid is
-to handshake with a deadline and individually suspend only the threads that did
-not answer. See `FUGC-NOTES.md`.
+The remaining two fields are each needed only sometimes: `ti` only for
+finalizable blocks, `usedSize` only for appendable ones. Moving them to side
+tables keyed by slot would take a 16-byte object's overhead down further, at the
+cost of a lookup on the array-append path — which is hot, so this needs
+measuring before it is worth doing.
 
 ### 5. `GC.collect()` collects only the calling thread
 

@@ -50,6 +50,23 @@ use those objects. See `CROSS-THREAD.md`.
 
 === Changed — performance
 
+* *Slot state moved into per-chunk bitvectors.* `allocated`, `marked` and
+  `shared` were fields of a 24-byte `SlotMeta` per slot, so clearing every mark
+  meant a read-modify-write across all of it and the sweep touched 24 bytes to
+  read one bit. They are now bitvectors, with attributes in a byte array;
+  clearing marks is a `memset` over n/8 bytes and the sweep tests
+  `allocated & ~marked & ~shared` 64 slots per word.
++
+Per-slot metadata drops from 24 bytes to 17.375 -- measured as 48.50 to 41.94
+bytes of arena per 16-byte object, 64.55 to 58.00 for 32-byte. Collection time
+is unchanged (256k live objects: 1.83 ms), which is itself the finding: phase
+timing shows conservative marking dominates at roughly 90% and sweeping was
+already about 4%, so the SIMD-sweep win FUGC reports does not transfer. The
+payoff here is density.
++
+Prompted by FUGC; see `FUGC-NOTES.md`, which also records why soft handshakes
+are *not* portable -- they need the same store barrier concurrent marking does.
+
 * *Size classes extended to 32 KiB, and large blocks report their true size.*
   Any request between 8 KiB and 64 KiB previously fell through to a dedicated
   64 KiB chunk run, and both `GC.sizeOf` and the scanned range reported the
