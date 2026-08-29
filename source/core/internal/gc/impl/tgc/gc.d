@@ -256,6 +256,31 @@ private enum size_t collectThresholdInit = 256 * 1024;
  */
 private shared size_t heapGrowthFactor = 4;
 
+/**
+ * Headroom above which the growth factor tapers toward +20%.
+ *
+ * A flat multiplier is fine while the heap is small and ruinous once it is
+ * large: x4 on a 1 GB live set means not collecting until 4 GB. BEAM solves the
+ * same problem by growing its per-process heaps along a Fibonacci-ish sequence
+ * up to about a megaword and then in 20% increments; this is the same shape,
+ * expressed as a cap on the absolute headroom.
+ */
+private enum size_t growthTaperAbove = 32 * 1024 * 1024;
+
+/// Collection threshold for a heap holding `live` bytes.
+private size_t thresholdFor(size_t live) nothrow @nogc
+{
+    immutable size_t g = atomicLoad(heapGrowthFactor);
+    immutable size_t wanted = live * (g - 1);
+    immutable size_t capped = growthTaperAbove > live / 5 ? growthTaperAbove : live / 5;
+    immutable size_t headroom = wanted < capped ? wanted : capped;
+
+    size_t t = live + headroom;
+    if (t < collectThresholdInit)
+        t = collectThresholdInit;
+    return t;
+}
+
 /// Set the heap growth factor; clamped to at least 2.
 extern (C) void tgc_setHeapGrowth(size_t factor) nothrow @nogc
 {
@@ -2281,9 +2306,7 @@ private:
         // Recompute the trigger from what actually survived. The previous
         // scheme only ever raised the threshold, so a program that spiked once
         // and then settled would never collect again.
-        heap.collectThreshold = heap.usedBytes * atomicLoad(heapGrowthFactor);
-        if (heap.collectThreshold < collectThresholdInit)
-            heap.collectThreshold = collectThresholdInit;
+        heap.collectThreshold = thresholdFor(heap.usedBytes);
 
         heap.numCollections++;
         heap.collecting = false;
