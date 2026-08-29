@@ -10,10 +10,11 @@ The original audit's findings and what was done about them are recorded in
 
 ## Done
 
-Memory safety: TLS scanning, register spilling, 16-byte payload alignment,
-one-past-the-end marking, `disable()`/`collect()` semantics, finalization at
-thread exit, `TypeInfo` capture for struct finalizers, `realloc` accounting,
-atomics on cross-thread state, unattached-thread collection refusal,
+Memory safety: TLS scanning, register spilling, **fiber/all-context stack
+scanning**, 16-byte payload alignment, one-past-the-end marking,
+`disable()`/`collect()` semantics, **thread-teardown use-after-free (Phase 0 of
+the cross-thread fix)**, `TypeInfo` capture for struct finalizers, `realloc`
+accounting, atomics on cross-thread state, unattached-thread collection refusal,
 `runFinalizers`.
 
 Performance: chunk-arena allocator with O(1) pointer resolution, explicit mark
@@ -41,6 +42,21 @@ Quadratic → linear. Appending 100,000 elements: 100,000 reallocations → 13.
 ## Open — design decision required
 
 ### 1. Cross-thread ownership transfer is unsound, and unenforced
+
+> Researched in depth in [CROSS-THREAD.md](CROSS-THREAD.md), which supersedes
+> the options sketched below. Headline: the problem is worse than "users must
+> not share" — `Thread`'s closure, the `Thread` object and `join()`'s exception
+> propagation all cross heaps by construction. D's type system cannot fix this
+> at allocation time (the spec blesses `cast(shared)` on thread-local data), but
+> collection-time escape detection can.
+>
+> **Phase 0 is done**: a dying thread's arenas are retained rather than
+> finalized and freed, which closes the `join()` use-after-free. Phases 1 and 2
+> (sticky promotion on global reachability, then cooperative global collection)
+> remain open, and are what the rest of this item is about.
+
+This is the one item from the audit deliberately **not** fixed, because it is a
+design decision rather than a bug fix.
 
 The docs say transfer is the single supported cross-thread path. The
 implementation cannot make it safe:
@@ -73,7 +89,25 @@ reachable and untested — is the worst of the three.
 
 ## Open — smaller items
 
-### 2. Space amplification for small objects
+### 2. Dead threads' memory is never reclaimed (Phase 0's accepted cost)
+
+Adopted arenas are retained until the process exits and their objects are never
+finalized. Fine for a fixed worker pool; bad for a program that spawns many
+short-lived threads, where it is an unbounded leak. Phase 2's cooperative global
+collection is what makes those arenas reclaimable — until then this is a real
+constraint on which programs should select tgc.
+
+### 3. Every thread scans every other thread's fibers
+
+Fiber stacks are found through druntime's global `ThreadBase.sm_cbeg` list,
+which records no fiber-to-thread affinity. So with 4 threads × 2,500 fibers, all
+four scan all 10,000 rather than their own 2,500 — about 4× the necessary work,
+at a measured ~0.32 µs per suspended fiber. Narrowing it means tgc tracking
+affinity itself, which needs a hook druntime does not expose today; the
+fallback is a tgc-side registry updated when a fiber is first seen running on a
+thread.
+
+### 4. Space amplification for small objects
 
 Each slot carries a 24-byte `SlotMeta` (`TypeInfo`, `usedSize`, `attr`,
 `flags`). For a 16-byte slot that is 150% overhead.
@@ -83,7 +117,7 @@ respectively. Moving them into side tables keyed by slot index, and reducing
 `flags`/`marked` to bitmaps, would cut per-slot metadata to ~4 bytes plus 2
 bits. Worth doing before claiming competitive memory behaviour.
 
-### 3. `GC.collect()` collects only the calling thread
+### 5. `GC.collect()` collects only the calling thread
 
 A user calling `GC.collect()` before a latency-critical section reclaims
 nothing from any other thread, and an idle or blocked thread's garbage is never
@@ -91,30 +125,30 @@ reclaimed because collection is driven purely by that thread's own allocation
 threshold. Consider a cooperative "collect at your next safepoint" flag that
 other threads poll in `alloc`.
 
-### 4. `reserve()` still returns 0
+### 6. `reserve()` still returns 0
 
 Pre-committing arena chunks for a requested size would let latency-sensitive
 callers pay the allocation cost up front. `extend()` now reports usable slack
 but cannot grow a slot.
 
-### 5. Benchmarks are not in the repo
+### 7. Benchmarks are not in the repo
 
 The numbers above come from throwaway probes. A `bench/` target comparing tgc
 against `conservative` on pause distribution, N-thread scaling and allocation
 throughput belongs in the repository, ideally tracked in CI so a regression in
 the mark phase is visible.
 
-### 6. Conservative-only marking
+### 8. Conservative-only marking
 
 `TypeInfo` is now recorded per block but unused for scanning. Precise scanning
 of blocks with known pointer maps would cut both false retention and mark time.
 
-### 7. `ThreadGC` is never destroyed
+### 9. `ThreadGC` is never destroyed
 
 The instance is `malloc`'d and `emplace`'d; `roots`/`ranges` leak at shutdown.
 Harmless in practice, untidy.
 
-### 8. Sanitizers have never actually run — CI will be their first execution
+### 10. Sanitizers have never actually run — CI will be their first execution
 
 The ASan and TSan jobs are wired up and target `ubuntu-latest`, but **neither
 has been run successfully**, because both sanitizer runtimes are broken on the

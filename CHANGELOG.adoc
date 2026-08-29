@@ -22,9 +22,19 @@
   cannot destroy a neighbouring block.
 * *`GC.disable()` no longer suppresses an explicit `GC.collect()`.* It now
   suppresses only allocation-triggered collections, and nests as a counter.
-* *Destructors run for objects alive at thread exit.* `cleanupThread` freed
-  every remaining block without finalizing. It also tore the heap down before
-  unregistering it, racing other threads' lookups; the order is now reversed.
+* *A dying thread's memory is retained, not finalized and freed.*
+  `cleanupThread` released every remaining block. `Thread.join()` propagates the
+  child's `Throwable` to the parent *after* that cleanup runs, so the parent
+  received a destructed object in freed memory — a use-after-free reachable from
+  an ordinary `throw` inside a thread. Arenas are now adopted by a heap that no
+  collection sweeps.
++
+NOTE: This reverses an intermediate change made earlier in this same cycle,
+which had `cleanupThread` *run* finalizers on the theory that thread exit is
+analogous to program termination. It is not: the parent may still be about to
+use those objects. See `CROSS-THREAD.md`.
+* `cleanupThread` also tore the heap down before unregistering it, racing other
+  threads' lookups; the order is now reversed.
 * *`TypeInfo` is recorded at allocation* and passed to `rt_finalizeFromGC`, so
   struct finalizers can run. It was discarded and `null` was passed.
 * *`realloc` no longer corrupts heap accounting.* Shrinking rewrote the stored
@@ -101,6 +111,30 @@ Scaling is now linear rather than quadratic.
   scanning reads padding, redzones and quarantined memory by design, so those
   reads must not be reported. Test iteration counts scale down under
   `version(TgcSanitize)`.
+
+* *Fiber stacks are scanned.* `thread_stackBottom()` reports only the running
+  `StackContext`, so the collector saw exactly one stack: a collection triggered
+  inside a fiber missed the thread's own stack *and* every other suspended
+  fiber, freeing their live data. Since allocation triggers collection and, in a
+  fiber-based program, allocation happens inside fibers, this was the common
+  case rather than a corner case. tgc now walks druntime's global
+  `ThreadBase.sm_cbeg` context list — the same list the stop-the-world collector
+  uses — scanning each context's *used* span `[tstack, bstack)`.
++
+Measured cost, 50,000 live objects:
++
+[cols="1,1"]
+|===
+| suspended fibers | collect
+
+| 0      | 0.32 ms
+| 1,000  | 0.64 ms
+| 10,000 | 3.55 ms
+|===
++
+About 0.32 µs per suspended fiber. Known limitation: the context list is global,
+so every thread scans every other thread's fibers. druntime records no
+fiber-to-thread affinity, so narrowing this needs tgc-side tracking.
 
 === Fixed — found during this work
 

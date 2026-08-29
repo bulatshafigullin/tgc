@@ -325,22 +325,75 @@ class ThreadExitCanary
     ubyte[64] pad;
 }
 
+shared size_t threadExitBlock;
+
 unittest
 {
-    // An object still alive when its owning thread exits must have its
-    // destructor run, exactly as it would at program termination. Freeing the
-    // thread's blocks without finalizing silently skips every destructor.
+    // An object alive when its thread exits must NOT be finalized or freed.
+    //
+    // This reverses an earlier assumption. Finalizing at thread exit looks
+    // right by analogy with program termination, but Thread.join() propagates
+    // the child's Throwable to the parent *after* cleanup has run — so running
+    // destructors and releasing arenas there hands the parent a destructed
+    // object in freed memory. The arenas are adopted instead and stay valid.
     atomicStore(threadExitDtorRan, 0);
+    atomicStore(threadExitBlock, cast(size_t) 0);
 
     auto t = new Thread({
         auto keep = new ThreadExitCanary;
+        keep.pad[0] = 0x7E;
+        atomicStore(threadExitBlock, cast(size_t) cast(void*) keep);
         keepAlive(cast(void*) keep);
     });
     t.start();
     t.join();
 
-    assert(atomicLoad(threadExitDtorRan) == 1,
-        "destructor of an object alive at thread exit did not run");
+    assert(atomicLoad(threadExitDtorRan) == 0,
+        "an object alive at thread exit was finalized, so Thread.join() would " ~
+        "hand the parent a destructed object");
+
+    auto p = cast(void*) atomicLoad(threadExitBlock);
+    assert(p !is null);
+    assert(GC.sizeOf(p) > 0,
+        "memory from an exited thread was released while still reachable");
+}
+
+__gshared int joinExcDtorRan;
+
+class JoinError : Exception
+{
+    ubyte[64] payload;
+    this(string m) { super(m); payload[] = 0xAB; }
+    ~this() { joinExcDtorRan = 1; }
+}
+
+unittest
+{
+    // The concrete case the rule above exists for: throwing in a thread and
+    // joining it. The Throwable is allocated on the child's heap and delivered
+    // to the parent after the child is gone.
+    joinExcDtorRan = 0;
+
+    auto t = new Thread({ throw new JoinError("boom"); });
+    t.start();
+
+    bool caught = false;
+    try
+    {
+        t.join();
+    }
+    catch (JoinError e)
+    {
+        caught = true;
+        assert(joinExcDtorRan == 0,
+            "the child's exception was destructed before the parent caught it");
+        assert(GC.sizeOf(cast(void*) e) > 0,
+            "the child's exception was freed before the parent caught it");
+        assert(e.msg == "boom", "exception message corrupted across join()");
+        foreach (b; e.payload)
+            assert(b == 0xAB, "exception payload corrupted across join()");
+    }
+    assert(caught, "Thread.join() did not propagate the child's exception");
 }
 
 __gshared int structDtorRan;

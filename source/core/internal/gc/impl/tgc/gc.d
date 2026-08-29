@@ -30,6 +30,7 @@ import core.internal.container.array;
 import core.internal.spinlock;
 import core.internal.traits : externDFunc;
 
+import core.thread.context : StackContext;
 import core.thread.threadbase : ThreadBase;
 
 import cstdlib = core.stdc.stdlib : calloc, free, malloc, realloc;
@@ -68,6 +69,49 @@ private
     {
         (cast(FinalizeFn) &rt_finalizeFromGC)(p, size, attr, ti);
     }
+}
+
+/**
+ * Head of druntime's global list of every registered stack context.
+ *
+ * This is the list `thread_scanAllType` walks, and it contains fiber stacks as
+ * well as thread stacks — `Fiber` registers its context with
+ * `ThreadBase.add(m_ctxt)` on construction. tgc needs it because scanning only
+ * the running stack silently loses every suspended fiber.
+ *
+ * Reached through `__traits(getMember)` because the field is not public. As
+ * with the rt.tlsgc handle, a druntime rename must be a hard build failure: a
+ * silent fallback here means fibers' live data gets freed underneath them.
+ */
+private StackContext* globalStackContexts() nothrow @nogc
+{
+    static if (__traits(compiles, __traits(getMember, ThreadBase, "sm_cbeg")))
+        return cast(StackContext*) __traits(getMember, ThreadBase, "sm_cbeg");
+    else
+        static assert(false,
+            "tgc: cannot reach druntime's global stack-context list " ~
+            "(ThreadBase.sm_cbeg). Without it, suspended fiber stacks cannot " ~
+            "be scanned and the collector would free live data held by any " ~
+            "fiber parked on a yield. Port this to the current druntime " ~
+            "before using tgc.");
+}
+
+/**
+ * druntime's lock guarding the global thread and stack-context lists.
+ *
+ * Taking it during a collection follows druntime's own documented lock order —
+ * "the GC acquires this lock after the GC lock" — so it cannot invert. The
+ * inverse (allocating while holding it) is what deadlocks, and tgc never does
+ * that.
+ */
+private auto threadListLock() nothrow @nogc
+{
+    static if (__traits(compiles, __traits(getMember, ThreadBase, "slock")))
+        return __traits(getMember, ThreadBase, "slock");
+    else
+        static assert(false,
+            "tgc: cannot reach druntime's thread-list lock (ThreadBase.slock), " ~
+            "needed to snapshot the stack-context list safely.");
 }
 
 /**
@@ -511,9 +555,13 @@ private struct ThreadHeap
     size_t rootSnapCap;
     RangeSnap* rangeSnap;
     size_t rangeSnapCap;
+    RangeSnap* stackSnap;
+    size_t stackSnapCap;
 
     bool collecting;
     bool finalizing;
+    /// Set on the single heap that adopts dead threads' arenas. Never collected.
+    bool isOrphan;
 
     static ThreadHeap* create() nothrow @nogc
     {
@@ -534,10 +582,12 @@ private struct ThreadHeap
         cstdlib.free(markStack);
         cstdlib.free(rootSnap);
         cstdlib.free(rangeSnap);
+        cstdlib.free(stackSnap);
         remotePtrs = null;
         markStack = null;
         rootSnap = null;
         rangeSnap = null;
+        stackSnap = null;
     }
 
     // -- chunk lifecycle ----------------------------------------------------
@@ -916,6 +966,72 @@ private void unregisterHeap(ThreadHeap* h) nothrow @nogc
     heapsLock.unlock();
 }
 
+/**
+ * Heap that adopts the arenas of threads that have exited.
+ *
+ * A dying thread's memory cannot simply be finalized and released. `Thread.join`
+ * propagates the child's `Throwable` to the parent *after* the child's cleanup
+ * has run, so releasing here hands the parent a destructed object in freed
+ * memory — reachable from ordinary code, no cast or unsafe construct involved.
+ * The same applies to anything else the child published before exiting.
+ *
+ * Phase 0 of the fix (see CROSS-THREAD.md): keep the memory. Chunks move to
+ * this heap, which no thread owns and no collection ever sweeps, so the blocks
+ * stay valid and unfinalized. The cost is that a dead thread's memory is not
+ * reclaimed until the process exits; a cooperative global collection (Phase 2)
+ * is what makes it reclaimable.
+ */
+private __gshared ThreadHeap* orphanHeap;
+private __gshared SpinLock orphanLock;
+
+private void adoptOrphanChunks(ThreadHeap* dying) nothrow @nogc
+{
+    if (dying.allChunks is null)
+        return;
+
+    orphanLock.lock();
+
+    if (orphanHeap is null)
+    {
+        orphanHeap = ThreadHeap.create();
+        orphanHeap.isOrphan = true;
+        registerHeap(orphanHeap);
+    }
+
+    auto c = dying.allChunks;
+    while (c)
+    {
+        auto next = c.nextAll;
+        auto raw = cast(ubyte*) c;
+
+        foreach (i; 0 .. c.runChunks)
+            dying.map.remove(cast(void*)(raw + i * chunkSize));
+        dying.unlinkPartial(c);
+        dying.unlinkAll(c);
+
+        c.heap = orphanHeap;
+        // Never hand orphaned slots back out: the adopting heap is not owned by
+        // any thread, so nothing would ever scan a new allocation's roots.
+        c.inPartial = false;
+        c.nextPartial = null;
+        c.prevPartial = null;
+
+        orphanHeap.linkAll(c);
+        foreach (i; 0 .. c.runChunks)
+            orphanHeap.map.put(cast(void*)(raw + i * chunkSize), c);
+
+        orphanHeap.reservedBytes += c.runChunks * chunkSize;
+        orphanHeap.usedBytes += c.isLarge()
+            ? c.largeSize
+            : (c.slotCount - c.freeCount) * c.slotSize;
+
+        c = next;
+    }
+
+    dying.allChunks = null;
+    orphanLock.unlock();
+}
+
 private ThreadHeap* currentHeap() nothrow @nogc
 {
     if (tlsHeap)
@@ -932,6 +1048,7 @@ private ThreadHeap* currentHeap() nothrow @nogc
 private pragma(crt_constructor) void gc_tgc_ctor()
 {
     heapsLock = SpinLock(SpinLock.Contention.brief);
+    orphanLock = SpinLock(SpinLock.Contention.brief);
     _d_register_tgc_gc();
 }
 
@@ -1137,6 +1254,8 @@ class ThreadGC : GC
         if (!b.valid())
             return;
         auto owner = b.chunk.heap;
+        if (owner.isOrphan)
+            return; // adopted from a dead thread; retained, never reused
         auto local = tlsHeap;
         if (owner is local || local is null)
         {
@@ -1432,26 +1551,11 @@ class ThreadGC : GC
 
         h.drainRemote();
 
-        // Objects still alive at thread exit must have their destructors run,
-        // exactly as they would at program termination.
-        h.finalizing = true;
-        auto c = h.allChunks;
-        while (c)
-        {
-            auto next = c.nextAll;
-            foreach (idx; 0 .. c.slotCount)
-            {
-                auto m = &c.meta[idx];
-                if (!(m.flags & slotAllocated))
-                    continue;
-                if (m.attr & (BlkAttr.FINALIZE | BlkAttr.STRUCTFINAL))
-                    finalizeBlock(c.slotAt(idx), c.capacity(), m.attr, m.ti);
-            }
-            chunkFree(c);
-            c = next;
-        }
-        h.finalizing = false;
-        h.allChunks = null;
+        // Do NOT finalize or release the thread's blocks here. Thread.join()
+        // hands the child's Throwable to the parent after this point, so doing
+        // either is a use-after-free in ordinary code. Move the arenas to the
+        // orphan heap, where they stay valid and unswept.
+        adoptOrphanChunks(h);
 
         if (tlsHeap is h)
             tlsHeap = null;
@@ -1557,7 +1661,7 @@ private:
         // Mark from this thread's stack and callee-saved registers. The shell
         // spills the registers so they land in the scanned range; no other
         // thread is suspended.
-        callWithStackShell((void* sp) nothrow { markStack(heap, sp); });
+        callWithStackShell((void* sp) nothrow { markStacks(heap, sp); });
 
         // Mark from this thread's TLS.
         markTLS(heap);
@@ -1631,21 +1735,98 @@ private:
         }
     }
 
+    /// Scan a stack range without caring which end is which.
     @conservativeScan
-    void markStack(ThreadHeap* heap, void* sp) nothrow
+    void markStackSpan(ThreadHeap* heap, void* a, void* b) nothrow
     {
-        auto bottom = thread_stackBottom();
-        if (!sp || !bottom)
+        if (!a || !b || a is b)
             return;
-        void* lo = sp;
-        void* hi = bottom;
-        if (lo > hi)
+        if (a < b)
+            markRange(heap, a, b);
+        else
+            markRange(heap, b, a);
+    }
+
+    /**
+     * Scan every stack that could hold a reference into this heap.
+     *
+     * Scanning only the running stack is not enough once fibers exist.
+     * `thread_stackBottom()` reports the *current* `StackContext`, so a
+     * collection triggered inside a fiber would scan that fiber and nothing
+     * else — not the thread's own stack, and not any other fiber parked on a
+     * yield. In a fiber-per-connection server almost every allocation happens
+     * inside a fiber, so that is the common case, and every suspended fiber's
+     * live data would be freed underneath it.
+     *
+     * druntime registers every stack — thread stacks and fiber stacks alike —
+     * on the global `ThreadBase.sm_cbeg` list, which is what the stop-the-world
+     * collector walks. We walk the same list. Only the *used* span
+     * `[tstack, bstack)` of each context is scanned, so an idle fiber costs the
+     * few hundred bytes it is actually using rather than its whole reserved
+     * stack.
+     */
+    @conservativeScan
+    void markStacks(ThreadHeap* heap, void* sp) nothrow
+    {
+        // The running context is the only one whose saved `tstack` is stale,
+        // so scan it precisely from the stack pointer the register-spill shell
+        // handed us.
+        auto curBottom = thread_stackBottom();
+        markStackSpan(heap, sp, curBottom);
+
+        // Snapshot the remaining contexts, then scan outside the lock. Holding
+        // druntime's thread lock across the mark would block every thread
+        // creating a fiber or a thread for the duration of a collection.
+        size_t n = snapshotStackContexts(heap, curBottom);
+        foreach (i; 0 .. n)
+            markStackSpan(heap, heap.stackSnap[i].pbot, heap.stackSnap[i].ptop);
+    }
+
+    /**
+     * Copy the used span of every registered stack context except the running
+     * one into the heap's scratch buffer, under druntime's thread lock.
+     *
+     * Taking `slock` here follows druntime's documented lock order (the GC lock
+     * is acquired before it, never after), so it cannot invert.
+     */
+    size_t snapshotStackContexts(ThreadHeap* heap, void* curBottom) nothrow
+    {
+        auto lock = threadListLock();
+        lock.lock_nothrow();
+
+        size_t count = 0;
+        for (auto c = globalStackContexts(); c; c = c.next)
+            count++;
+
+        if (count > heap.stackSnapCap)
         {
-            auto tmp = lo;
-            lo = hi;
-            hi = tmp;
+            size_t ncap = count + (count >> 1) + 8;
+            auto np = cast(RangeSnap*) cstdlib.realloc(heap.stackSnap, ncap * RangeSnap.sizeof);
+            if (!np)
+            {
+                lock.unlock_nothrow();
+                onOutOfMemoryError();
+            }
+            heap.stackSnap = np;
+            heap.stackSnapCap = ncap;
         }
-        markRange(heap, lo, hi);
+
+        size_t n = 0;
+        for (auto c = globalStackContexts(); c && n < count; c = c.next)
+        {
+            // Skip the running context: handled precisely above, and its
+            // recorded tstack is stale while it executes.
+            if (c.bstack is curBottom)
+                continue;
+            // A fiber that has not started, or has finished, has tstack ==
+            // bstack and contributes nothing.
+            if (!c.tstack || !c.bstack || c.tstack is c.bstack)
+                continue;
+            heap.stackSnap[n++] = RangeSnap(c.tstack, c.bstack);
+        }
+
+        lock.unlock_nothrow();
+        return n;
     }
 
     @conservativeScan
