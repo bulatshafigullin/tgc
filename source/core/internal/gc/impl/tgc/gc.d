@@ -219,14 +219,26 @@ static assert(chunkSize % payloadAlign == 0);
 private enum size_t chunkMask = ~(chunkSize - 1);
 
 /// Allocations larger than this get a dedicated chunk run instead of a slot.
-private enum size_t maxSmall = 8192;
+private enum size_t maxSmall = 32768;
 
+/**
+ * Size classes.
+ *
+ * The range above 8 KiB matters more than it looks. Without it, a 9000-byte
+ * request fell straight through to a dedicated 64 KiB chunk run: 7.3x space
+ * amplification, and the whole run was scanned and zeroed on every touch. HTTP
+ * buffers live exactly there.
+ */
 private static immutable uint[] sizeClasses = [
     16, 32, 48, 64, 80, 96, 112, 128,
     160, 192, 224, 256, 320, 384, 448, 512,
     640, 768, 896, 1024, 1280, 1536, 1792, 2048,
     2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192,
+    10240, 12288, 14336, 16384, 20480, 24576, 28672, 32768,
 ];
+
+/// Aim for at least this many slots per chunk, so a chunk is worth its header.
+private enum size_t minSlotsPerChunk = 8;
 
 private enum size_t numClasses = sizeClasses.length;
 
@@ -695,7 +707,14 @@ private struct ThreadHeap
     {
         immutable uint slotSize = sizeClasses[cls];
 
-        auto raw = chunkAlloc(chunkSize);
+        // Bigger classes get a run of units, so a chunk still holds a useful
+        // number of slots instead of one slot and a lot of slack.
+        size_t units = (slotSize * minSlotsPerChunk + chunkSize - 1) / chunkSize;
+        if (units < 1)
+            units = 1;
+        immutable size_t bytes = units * chunkSize;
+
+        auto raw = chunkAlloc(bytes);
         if (!raw)
             onOutOfMemoryError();
         memset(raw, 0, Chunk.sizeof);
@@ -704,12 +723,12 @@ private struct ThreadHeap
         immutable size_t metaOff = alignUp(Chunk.sizeof, size_t.sizeof);
 
         // Fit as many (slot + metadata) pairs as the chunk allows.
-        size_t count = (chunkSize - metaOff) / (slotSize + SlotMeta.sizeof);
+        size_t count = (bytes - metaOff) / (slotSize + SlotMeta.sizeof);
         size_t dataOff;
         for (;;)
         {
             dataOff = alignUp(metaOff + count * SlotMeta.sizeof, payloadAlign);
-            if (count == 0 || dataOff + count * slotSize <= chunkSize)
+            if (count == 0 || dataOff + count * slotSize <= bytes)
                 break;
             count--;
         }
@@ -722,7 +741,7 @@ private struct ThreadHeap
         c.slotCount = cast(uint) count;
         c.freeCount = cast(uint) count;
         c.cls = cls;
-        c.runChunks = 1;
+        c.runChunks = units;
 
         memset(c.meta, 0, count * SlotMeta.sizeof);
 
@@ -735,10 +754,11 @@ private struct ThreadHeap
             c.freeHead = slot;
         }
 
-        map.put(raw, c);
+        foreach (i; 0 .. units)
+            map.put(cast(void*)(cast(ubyte*) raw + i * chunkSize), c);
         linkAll(c);
         linkPartial(c);
-        reservedBytes += chunkSize;
+        reservedBytes += bytes;
         return c;
     }
 
@@ -766,7 +786,10 @@ private struct ThreadHeap
         c.freeCount = 0;
         c.cls = uint.max;
         c.runChunks = runChunks;
-        c.largeSize = runChunks * chunkSize - dataOff;
+        // The request, not the whole rounded-up run. Reporting the run made a
+        // 9000-byte allocation look like 65408 bytes, and every collection
+        // scanned -- and every allocation zeroed -- all of it.
+        c.largeSize = alignUp(size, payloadAlign);
 
         // Every chunk base in the run resolves back to the head, so an
         // interior pointer anywhere in a large object is one probe away.

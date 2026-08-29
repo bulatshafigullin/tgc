@@ -50,6 +50,28 @@ use those objects. See `CROSS-THREAD.md`.
 
 === Changed — performance
 
+* *Size classes extended to 32 KiB, and large blocks report their true size.*
+  Any request between 8 KiB and 64 KiB previously fell through to a dedicated
+  64 KiB chunk run, and both `GC.sizeOf` and the scanned range reported the
+  whole run -- so a 9000-byte allocation occupied and scanned 65408 bytes, and
+  every allocation zeroed all of it. HTTP-sized buffers land exactly there.
++
+The bigger classes are served from multi-unit chunks so a chunk still holds at
+least eight slots, and genuinely large blocks now record the requested size
+rather than the rounded-up run.
++
+[cols="1,1,1"]
+|===
+| | before | after
+
+| 9000-byte request | 65408 B (7.3x) | 10240 B (1.1x)
+| 4000 x 9000 B, memory | 249.6 MB | 39.1 MB
+| 4000 x 9000 B, collect | 62.3 ms | 7.6 ms
+|===
++
+General collection scaling is unchanged (256k live objects: 1.85 ms). Prompted
+by reading FUGC; see `FUGC-NOTES.md`.
+
 * *Chunk-arena allocator.* Memory now comes from 64 KiB chunk-aligned arenas
   carved into size-class slots. A candidate pointer resolves to its block by
   masking and indexing instead of walking a linked list, so `markPtr`,

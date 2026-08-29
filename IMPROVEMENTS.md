@@ -128,15 +128,30 @@ affinity itself, which needs a hook druntime does not expose today; the
 fallback is a tgc-side registry updated when a fiber is first seen running on a
 thread.
 
-### 4. Space amplification for small objects
+### 4. Per-slot metadata: 24 bytes, and the sweep reads all of it
 
 Each slot carries a 24-byte `SlotMeta` (`TypeInfo`, `usedSize`, `attr`,
-`flags`). For a 16-byte slot that is 150% overhead.
+`flags`). For a 16-byte slot that is 150% overhead, and the sweep touches all
+24 bytes per slot to read one mark bit.
 
-`ti` and `usedSize` are only meaningful for finalizable and appendable blocks
-respectively. Moving them into side tables keyed by slot index, and reducing
-`flags`/`marked` to bitmaps, would cut per-slot metadata to ~4 bytes plus 2
-bits. Worth doing before claiming competitive memory behaviour.
+FUGC spends under 5% of its time sweeping because its marks are bitvectors it
+can scan with SIMD. Moving `allocated`/`marked`/`shared` into per-chunk
+bitvectors would let the sweep skip 64 slots per word test *and* shrink
+`SlotMeta` to the genuinely per-object fields — one change, both problems. See
+`FUGC-NOTES.md`.
+
+### 4a. Global collection stops the world; soft handshakes would not
+
+`tgcCollectGlobal` uses `thread_suspendAll`. At a measured 0.07 ms this is not
+urgent, but FUGC shows the alternative: ask each thread to scan its own roots at
+its next safepoint and acknowledge, so no thread waits for any other. D has no
+compiler-emitted pollchecks, but `alloc` is a natural poll site that already
+tests flags on every call.
+
+The hard case is a thread blocked in a syscall, which never reaches a safepoint;
+FUGC solves it with an enter/exit protocol druntime lacks. A practical hybrid is
+to handshake with a deadline and individually suspend only the threads that did
+not answer. See `FUGC-NOTES.md`.
 
 ### 5. `GC.collect()` collects only the calling thread
 
@@ -163,6 +178,12 @@ the mark phase is visible.
 
 `TypeInfo` is now recorded per block but unused for scanning. Precise scanning
 of blocks with known pointer maps would cut both false retention and mark time.
+
+Note that full concurrency in FUGC's sense is *not* reachable: it depends on a
+Dijkstra store barrier, and D has no write barrier without compiler support.
+That is also why the sampled-promotion hole in `CROSS-THREAD.md` cannot be
+closed. What tgc gets in exchange is that a thread-local collection has no
+concurrent mutator at all, so it needs no barrier for the common case.
 
 ### 9. `ThreadGC` is never destroyed
 
