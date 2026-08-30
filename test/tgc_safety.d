@@ -792,3 +792,46 @@ unittest
         assert(arr[i] !is null);
     keepAlive(arr.ptr);
 }
+
+__gshared int mixedChunkDtors;
+/// Same size class as `PlainSlot` below, so both land in the same chunk.
+class DtorSlot { ~this() { mixedChunkDtors++; } ubyte[40] pad; }
+final class PlainSlot { ubyte[40] pad; }
+
+unittest
+{
+    // A chunk is swept a word at a time when it holds nothing finalizable,
+    // which is the common case and much cheaper than a per-slot walk. The flag
+    // that decides it is per *chunk*, not per slot, so a chunk holding a mix
+    // must take the per-slot path for all of it -- otherwise a destructor is
+    // silently skipped for objects sharing a chunk with plain ones.
+    enum n = 400 / workScale;
+
+    // Interleaved, so the two kinds are guaranteed to share chunks.
+    foreach (i; 0 .. n)
+    {
+        cast(void) new PlainSlot;
+        cast(void) new DtorSlot;
+    }
+
+    mixedChunkDtors = 0;
+    scrubStack();
+    foreach (_; 0 .. 3)
+        GC.collect();
+
+    assert(mixedChunkDtors > 0,
+        "destructors were skipped for objects sharing a chunk with " ~
+        "non-finalizable ones: the bulk sweep took a chunk it should not have");
+
+    // And the plain objects must actually be reclaimed rather than merely
+    // dropped from the free accounting: allocating the same shape again after
+    // the collection must reuse the chunk instead of growing the heap.
+    immutable before = GC.stats().usedSize;
+    foreach (i; 0 .. n)
+        cast(void) new PlainSlot;
+    scrubStack();
+    GC.collect();
+    immutable after = GC.stats().usedSize;
+    assert(after <= before + n * 64,
+        "the bulk sweep did not return slots to the allocator");
+}

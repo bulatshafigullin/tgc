@@ -283,15 +283,14 @@ private void* threadTLSData(ThreadBase t) nothrow @nogc
 private enum size_t payloadAlign = 16;
 
 /**
- * Arena granularity. Chunks are allocated aligned to their own size so that
- * `p & ~(chunkSize - 1)` yields a candidate chunk base in a couple of
- * instructions — the property that makes `markPtr` O(1).
+ * Arena granularity. Chunks are allocated aligned to their own size, so
+ * `p >> chunkShift` yields a candidate's chunk unit in one instruction — the
+ * property that makes `markPtr` O(1) — and a chunk's own header sits at its
+ * base, so the unit index converts straight back to a `Chunk*`.
  */
 private enum size_t chunkSize = 64 * 1024;
 static assert((chunkSize & (chunkSize - 1)) == 0, "chunkSize must be a power of two");
 static assert(chunkSize % payloadAlign == 0);
-
-private enum size_t chunkMask = ~(chunkSize - 1);
 
 /// Allocations larger than this get a dedicated chunk run instead of a slot.
 private enum size_t maxSmall = 32768;
@@ -469,13 +468,36 @@ extern (C) size_t tgc_getRetainedBytes() nothrow @nogc
     return atomicLoad(orphanBytes);
 }
 
+/**
+ * Size (in 16-byte steps) to size-class index.
+ *
+ * Every size class is a multiple of 16, so rounding a request up to 16 bytes
+ * loses nothing and the map is exact. Built at compile time; the linear scan it
+ * replaces ran on every allocation and showed up in the profile at 2%.
+ */
+private static immutable ubyte[maxSmall / payloadAlign + 1] classTable = ()
+{
+    ubyte[maxSmall / payloadAlign + 1] t;
+    foreach (i; 0 .. t.length)
+    {
+        immutable size_t want = i * payloadAlign;
+        foreach (k, sc; sizeClasses)
+            if (want <= sc)
+            {
+                t[i] = cast(ubyte) k;
+                break;
+            }
+    }
+    return t;
+}();
+
+static assert(sizeClasses.length <= ubyte.max + 1, "size-class index no longer fits in a byte");
+
 /// Maps a request size to a size-class index.
 private uint classOf(size_t size) nothrow @nogc
 {
-    foreach (i, sc; sizeClasses)
-        if (size <= sc)
-            return cast(uint) i;
-    assert(false, "classOf called with a large size");
+    assert(size <= maxSmall, "classOf called with a large size");
+    return classTable[(size + payloadAlign - 1) / payloadAlign];
 }
 
 private size_t alignUp(size_t n, size_t a) nothrow @nogc
@@ -624,6 +646,10 @@ private struct Chunk
     Region* region;   /// owning region, or null when owned by the thread heap
 
     bool inPartial;
+    /// Any slot in this chunk has been given a finalizer. Sticky, and only ever
+    /// a hint: it lets the sweep take the bulk path for chunks that hold no
+    /// destructors at all, which is most of them.
+    bool hasFinal;
 
     bool isLarge() const nothrow @nogc
     {
@@ -651,7 +677,13 @@ private struct Chunk
     void clearShared(size_t i) nothrow @nogc { clearBit(sharedBits, i); }
 
     uint attrOf(size_t i) const nothrow @nogc { return attrs[i]; }
-    void setAttrOf(size_t i, uint a) nothrow @nogc { attrs[i] = cast(ubyte)(a & keptAttrs); }
+
+    void setAttrOf(size_t i, uint a) nothrow @nogc
+    {
+        attrs[i] = cast(ubyte)(a & keptAttrs);
+        if (a & (BlkAttr.FINALIZE | BlkAttr.STRUCTFINAL))
+            hasFinal = true;
+    }
 
     /**
      * Index of the first unallocated slot at or after `from`; `slotCount` when
@@ -793,174 +825,225 @@ private struct BlkRef
 }
 
 // ---------------------------------------------------------------------------
-// chunk map: chunk base -> owning chunk, open addressed
+// chunk directory: address unit -> owning chunk, two-level and address-indexed
 // ---------------------------------------------------------------------------
 
+/// log2(chunkSize), so an address becomes a chunk-unit index by shifting.
+private enum size_t chunkShift = 16;
+static assert((cast(size_t) 1 << chunkShift) == chunkSize);
+
+/// Units covered by one second-level table: 4096 x 64 KiB = 256 MB, in 16 KiB.
+private enum size_t dirL2Bits = 12;
+private enum size_t dirL2Count = cast(size_t) 1 << dirL2Bits;
+private enum size_t dirL2Mask = dirL2Count - 1;
+
 /**
- * Per-heap map from chunk base address to `Chunk*`.
+ * Ceiling on the first-level table, which spans the lowest and highest chunk
+ * addresses the heap holds.
+ *
+ * 2^20 entries cover 256 TB, more than the 128 TB of user address space either
+ * supported platform hands out, so this is unreachable rather than a policy.
+ */
+private enum size_t dirL1MaxLen = cast(size_t) 1 << 20;
+
+/**
+ * Per-heap map from a chunk-sized address unit to the `Chunk` that owns it.
  *
  * Deliberately per-heap rather than global: a thread only ever marks its own
  * blocks, so the hot `markPtr` lookup needs no lock at all.
+ *
+ * This was an open-addressed hash table, and after `markPtr` itself it was the
+ * most expensive thing in the collector. Every candidate word scanned -- most of
+ * which are not pointers at all -- paid a 64-bit mixer and then a random probe
+ * into a table that at a 74 MB live set is exactly L1-sized. Marking a tree
+ * therefore missed cache on the *metadata* before it ever touched the object.
+ *
+ * Indexing by address instead of hashing it gives two things. A candidate
+ * outside [loAddr, hiAddr) is rejected in two compares without touching memory
+ * at all, which is the common case for stack and TLS words. And chunks adjacent
+ * in memory -- what a tree walk actually touches -- land on adjacent entries, so
+ * the directory streams like an array instead of thrashing like a hash.
+ *
+ * An entry is a `uint`, not a `Chunk*`, because a chunk's header lives at its
+ * own base: for the head unit of a run the chunk pointer *is* the masked
+ * address, and for every following unit it is that many units back. That halves
+ * the table and removes the second dependent load a hash map needs (key, then
+ * value).
+ *
+ * A second-level table costs 16 KiB and covers 256 MB of address space, so a
+ * heap whose chunks cluster -- which is what an aligned allocator gives -- needs
+ * one or two. A heap whose chunks were scattered one per 256 MB region would pay
+ * 16 KiB per chunk, which is the structure's worst case and not one any
+ * allocator produces.
  */
-private struct ChunkMap
+private struct ChunkDir
 {
-    void** keys;
-    Chunk** vals;
-    size_t cap;      /// power of two
-    size_t len;      /// live entries
-    size_t occupied; /// live entries + tombstones
+    uint** l1;      /// second-level tables for blocks [l1Base, l1Base + l1Len)
+    size_t l1Base;
+    size_t l1Len;
 
-    /// Sentinel for a deleted entry. Kept integral: a compile-time
-    /// int-to-pointer cast is not portable across D compilers.
-    enum size_t tombstoneBits = 1;
+    size_t len;     /// live units, so an empty directory short-circuits
+    void* loAddr;   /// lowest mapped chunk base
+    void* hiAddr;   /// one past the highest mapped chunk
 
-    static void* tombstone() nothrow @nogc
+    /// Last second-level table used. One block covers 256 MB, so unlike a
+    /// one-entry *chunk* cache (measured: 48% hits, not worth its bookkeeping)
+    /// this one is hit by essentially every lookup of a heap under 256 MB.
+    size_t lastBlk = size_t.max;
+    uint* lastTab;
+
+    /**
+     * Second-level table holding `unit`, allocating the path to it when
+     * `create` is set.
+     */
+    private uint* tableFor(size_t unit, bool create) nothrow @nogc
     {
-        return cast(void*) tombstoneBits;
-    }
+        immutable size_t blk = unit >> dirL2Bits;
+        if (blk == lastBlk && lastTab !is null)
+            return lastTab;
 
-    static size_t hash(void* base) nothrow @nogc
-    {
-        // Chunk bases are chunkSize-aligned, so the low bits carry no
-        // information; fold the useful bits down with a 64-bit mixer.
-        size_t x = (cast(size_t) base) / chunkSize;
-        x ^= x >> 33;
-        x *= 0xff51afd7ed558ccdUL;
-        x ^= x >> 33;
-        return x;
-    }
-
-    void grow(size_t newCap) nothrow @nogc
-    {
-        auto oldKeys = keys;
-        auto oldVals = vals;
-        auto oldCap = cap;
-
-        auto nk = cast(void**) cstdlib.calloc(newCap, (void*).sizeof);
-        auto nv = cast(Chunk**) cstdlib.calloc(newCap, (Chunk*).sizeof);
-        if (!nk || !nv)
+        if (l1Len == 0)
         {
-            cstdlib.free(nk);
-            cstdlib.free(nv);
+            if (!create)
+                return null;
+            l1 = cast(uint**) cstdlib.calloc(8, (uint*).sizeof);
+            if (!l1)
+                onOutOfMemoryError();
+            l1Base = blk;
+            l1Len = 8;
+        }
+        else if (blk < l1Base || blk - l1Base >= l1Len)
+        {
+            if (!create)
+                return null;
+            growToCover(blk);
+        }
+
+        auto slot = &l1[blk - l1Base];
+        if (*slot is null)
+        {
+            if (!create)
+                return null;
+            *slot = cast(uint*) cstdlib.calloc(dirL2Count, uint.sizeof);
+            if (!*slot)
+                onOutOfMemoryError();
+        }
+
+        lastBlk = blk;
+        lastTab = *slot;
+        return *slot;
+    }
+
+    /// Widen the first-level table so it covers `blk`, keeping existing entries.
+    private void growToCover(size_t blk) nothrow @nogc
+    {
+        size_t nbase = blk < l1Base ? blk : l1Base;
+        size_t ntop = blk + 1 > l1Base + l1Len ? blk + 1 : l1Base + l1Len;
+        size_t nlen = ntop - nbase;
+
+        // Round up so a heap that grows in one direction does not realloc per
+        // chunk, and keep some slack on the low side for the same reason.
+        size_t slack = nlen >> 1;
+        if (slack < 8)
+            slack = 8;
+        if (nbase < l1Base) // grew downward
+            nbase = nbase > slack ? nbase - slack : 0;
+        nlen = ntop + slack - nbase;
+
+        assert(nlen <= dirL1MaxLen, "tgc: chunk directory span exceeds the address space");
+
+        auto nl1 = cast(uint**) cstdlib.calloc(nlen, (uint*).sizeof);
+        if (!nl1)
             onOutOfMemoryError();
-        }
+        foreach (i; 0 .. l1Len)
+            nl1[l1Base - nbase + i] = l1[i];
 
-        keys = nk;
-        vals = nv;
-        cap = newCap;
-        len = 0;
-        occupied = 0;
-
-        foreach (i; 0 .. oldCap)
-        {
-            auto k = oldKeys[i];
-            if (k !is null && k !is tombstone())
-                put(k, oldVals[i]);
-        }
-
-        cstdlib.free(oldKeys);
-        cstdlib.free(oldVals);
+        cstdlib.free(l1);
+        l1 = nl1;
+        l1Base = nbase;
+        l1Len = nlen;
+        lastBlk = size_t.max; // the slot moved
+        lastTab = null;
     }
 
     void put(void* base, Chunk* c) nothrow @nogc
     {
-        if (cap == 0)
-            grow(64);
-        else if ((occupied + 1) * 4 >= cap * 3)
-            grow(len * 4 < cap ? cap : cap * 2);
+        immutable size_t unit = cast(size_t) base >> chunkShift;
+        immutable size_t head = cast(size_t) c >> chunkShift;
+        assert(unit >= head, "tgc: chunk unit precedes its run head");
+        assert(unit - head < uint.max, "tgc: chunk run longer than the tag can encode");
 
-        size_t mask = cap - 1;
-        size_t i = hash(base) & mask;
-        size_t firstTomb = size_t.max;
-        for (;;)
-        {
-            auto k = keys[i];
-            if (k is null)
-            {
-                if (firstTomb != size_t.max)
-                {
-                    keys[firstTomb] = base;
-                    vals[firstTomb] = c;
-                    len++;
-                    return; // reused a tombstone: `occupied` is unchanged
-                }
-                keys[i] = base;
-                vals[i] = c;
-                len++;
-                occupied++;
-                return;
-            }
-            if (k is tombstone())
-            {
-                if (firstTomb == size_t.max)
-                    firstTomb = i;
-            }
-            else if (k is base)
-            {
-                vals[i] = c;
-                return;
-            }
-            i = (i + 1) & mask;
-        }
+        auto t = tableFor(unit, true);
+        auto e = &t[unit & dirL2Mask];
+        if (*e == 0)
+            len++;
+        *e = cast(uint)(unit - head + 1);
+
+        if (loAddr is null || base < loAddr)
+            loAddr = base;
+        auto end = cast(void*)((unit + 1) << chunkShift);
+        if (end > hiAddr)
+            hiAddr = end;
     }
 
-    Chunk* get(void* base) nothrow @nogc
+    /**
+     * The chunk owning `p`, or null.
+     *
+     * Takes an interior pointer, not a chunk base: the unit index is a shift, so
+     * masking first would only throw away bits this already ignores.
+     */
+    Chunk* get(void* p) nothrow @nogc
     {
-        if (len == 0)
+        if (len == 0 || p < loAddr || p >= hiAddr)
             return null;
-        size_t mask = cap - 1;
-        size_t i = hash(base) & mask;
-        for (;;)
-        {
-            auto k = keys[i];
-            if (k is null)
-                return null;
-            if (k is base)
-                return vals[i];
-            i = (i + 1) & mask;
-        }
+
+        immutable size_t unit = cast(size_t) p >> chunkShift;
+        auto t = tableFor(unit, false);
+        if (t is null)
+            return null;
+        immutable uint tag = t[unit & dirL2Mask];
+        if (tag == 0)
+            return null;
+        return cast(Chunk*)((unit - (tag - 1)) << chunkShift);
     }
 
     void remove(void* base) nothrow @nogc
     {
         if (len == 0)
             return;
-        size_t mask = cap - 1;
-        size_t i = hash(base) & mask;
-        for (;;)
+        immutable size_t unit = cast(size_t) base >> chunkShift;
+        auto t = tableFor(unit, false);
+        if (t is null)
+            return;
+        auto e = &t[unit & dirL2Mask];
+        if (*e != 0)
         {
-            auto k = keys[i];
-            if (k is null)
-                return;
-            if (k is base)
-            {
-                keys[i] = tombstone();
-                vals[i] = null;
-                len--;
-                return;
-            }
-            i = (i + 1) & mask;
+            *e = 0;
+            len--;
         }
     }
 
-    /// Drop every entry but keep the allocation, for repeated rebuilds.
+    /// Drop every entry but keep the tables, for repeated rebuilds.
     void clearEntries() nothrow @nogc
     {
-        if (keys)
-            memset(keys, 0, cap * (void*).sizeof);
-        if (vals)
-            memset(vals, 0, cap * (Chunk*).sizeof);
+        foreach (i; 0 .. l1Len)
+            if (l1[i] !is null)
+                memset(l1[i], 0, dirL2Count * uint.sizeof);
         len = 0;
-        occupied = 0;
+        loAddr = null;
+        hiAddr = null;
     }
 
     void destroy() nothrow @nogc
     {
-        cstdlib.free(keys);
-        cstdlib.free(vals);
-        keys = null;
-        vals = null;
-        cap = len = occupied = 0;
+        foreach (i; 0 .. l1Len)
+            cstdlib.free(l1[i]);
+        cstdlib.free(l1);
+        l1 = null;
+        l1Base = l1Len = len = 0;
+        loAddr = hiAddr = null;
+        lastBlk = size_t.max;
+        lastTab = null;
     }
 }
 
@@ -1027,7 +1110,7 @@ private struct RangeSnap
 
 private struct ThreadHeap
 {
-    ChunkMap map;
+    ChunkDir map;
     Chunk* allChunks;
     Chunk*[numClasses] partial;
 
@@ -1041,6 +1124,22 @@ private struct ThreadHeap
     /// Set while verifying a region: markPtr records the first inbound hit.
     Region* verifyRegion;
     void* verifyHit;
+
+    /**
+     * One-entry memo for `layoutOf`.
+     *
+     * Resolving a block's pointer map means a virtual call into
+     * `TypeInfo.rtInfo` and two cold loads, paid once per marked object. Types
+     * repeat heavily inside one heap -- often there is only one hot one -- so
+     * remembering the last answer removes nearly all of it. Cleared at the
+     * start of every collection, so a change to `preciseScanning` between two
+     * of them cannot be missed.
+     */
+    TypeInfo memoTi;
+    bool memoAppendable;
+    bool memoScan;
+    const(size_t)* memoBitmap;
+    size_t memoElemWords;
 
     size_t usedBytes;      /// bytes in allocated slots
     size_t reservedBytes;  /// bytes held in chunks, allocated or not
@@ -1094,6 +1193,30 @@ private struct ThreadHeap
         rootSnap = null;
         rangeSnap = null;
         stackSnap = null;
+    }
+
+    /// `layoutOf` through the memo above.
+    bool layoutCached(TypeInfo ti, uint attr, out const(size_t)* bitmap,
+                      out size_t elemWords) nothrow
+    {
+        immutable bool app = (attr & BlkAttr.APPENDABLE) != 0;
+        if (ti !is null && ti is memoTi && app == memoAppendable)
+        {
+            bitmap = memoBitmap;
+            elemWords = memoElemWords;
+            return memoScan;
+        }
+
+        immutable bool scan = layoutOf(ti, attr, bitmap, elemWords);
+        if (ti !is null)
+        {
+            memoTi = ti;
+            memoAppendable = app;
+            memoScan = scan;
+            memoBitmap = bitmap;
+            memoElemWords = elemWords;
+        }
+        return scan;
     }
 
     // -- chunk lifecycle ----------------------------------------------------
@@ -1298,14 +1421,18 @@ private struct ThreadHeap
         if (!p)
             return BlkRef.init;
 
-        auto c = map.get(cast(void*)(cast(size_t) p & chunkMask));
+        auto c = map.get(p);
         if (!c)
         {
-            if (!acceptEnd)
-                return BlkRef.init;
             // A one-past-the-end pointer can land on the first byte of the
-            // following chunk, which may not be ours.
-            c = map.get(cast(void*)(((cast(size_t) p) - 1) & chunkMask));
+            // following chunk, which may not be ours -- but only when it is
+            // exactly on a chunk boundary. Anywhere else `p` and `p - 1` are in
+            // the same chunk, so retrying unconditionally (as this did) paid a
+            // second probe for every candidate word that is not a pointer at
+            // all, which is most of them.
+            if (!acceptEnd || (cast(size_t) p & (chunkSize - 1)) != 0)
+                return BlkRef.init;
+            c = map.get(cast(void*)(cast(size_t) p - 1));
             if (!c)
                 return BlkRef.init;
         }
@@ -1326,15 +1453,22 @@ private struct ThreadHeap
         if (p < c.data)
             return BlkRef.init;
         size_t off = cast(ubyte*) p - cast(ubyte*) c.data;
-        size_t idx = off / c.slotSize;
+        // A small chunk run is at most 256 KB, so the offset fits in 32 bits
+        // and the division is half the latency of a 64-bit one on x86-64. A
+        // multiply-by-reciprocal was tried here and measured *slower* on
+        // arm64; see IMPROVEMENTS.md.
+        immutable uint off32 = cast(uint) off;
+        immutable uint idx32 = off32 / c.slotSize;
+        size_t idx = idx32;
+        immutable size_t rem = off32 - idx32 * c.slotSize;
 
         if (idx >= c.slotCount)
         {
-            if (!acceptEnd || idx != c.slotCount || off % c.slotSize != 0)
+            if (!acceptEnd || idx != c.slotCount || rem != 0)
                 return BlkRef.init;
             idx = c.slotCount - 1; // exactly one past the final slot
         }
-        else if (acceptEnd && off % c.slotSize == 0 && idx > 0 && !c.isAllocated(idx))
+        else if (acceptEnd && rem == 0 && idx > 0 && !c.isAllocated(idx))
         {
             // Slot boundary: also consider it one-past-the-end of the
             // preceding slot before giving up.
@@ -1393,13 +1527,21 @@ private struct ThreadHeap
         return BlkRef(c, idx);
     }
 
+    /**
+     * Release one slot.
+     *
+     * The slot's `SlotMeta` and attribute byte are deliberately left as they
+     * are. `alloc` writes both on every slot it hands out, and nothing reads
+     * either for a slot that is not allocated -- `lookup` rejects those before
+     * any caller sees them. Clearing them here cost a 16-byte store and a byte
+     * store on cold lines for every dead object, which on binary-trees made
+     * this the most expensive routine in the collector on arm64.
+     */
     void freeSlot(BlkRef b) nothrow @nogc
     {
         auto c = b.chunk;
-        c.meta[b.idx] = SlotMeta.init;
         c.clearAllocated(b.idx);
         c.clearShared(b.idx);
-        c.setAttrOf(b.idx, 0);
 
         if (c.isLarge())
         {
@@ -1427,6 +1569,50 @@ private struct ThreadHeap
         if (attr & (BlkAttr.FINALIZE | BlkAttr.STRUCTFINAL))
             finalizeBlock(b.payload(), b.capacity(), attr, b.meta().ti);
         freeSlot(b);
+    }
+
+    /**
+     * Reclaim every dead slot in a chunk with word-at-a-time bit operations.
+     *
+     * Applies to a chunk that holds no finalizable slot, which is the common
+     * case: with no destructor to run, reclaiming a slot is exactly clearing
+     * its allocation bit, and 64 of those clear in one AND. The per-slot path
+     * additionally walked the bitmap once per dead object, updated the partial
+     * list per object and touched two cold metadata lines per object.
+     */
+    void sweepChunkBulk(Chunk* c) nothrow @nogc
+    {
+        import core.bitop : bsf, popcnt;
+
+        immutable size_t words = bitWords(c.slotCount);
+        size_t freed = 0;
+        size_t firstDead = size_t.max;
+
+        foreach (w; 0 .. words)
+        {
+            // Promoted slots are excluded, exactly as nextReclaimable does:
+            // only a global collection can prove no other thread holds them.
+            immutable size_t dead = c.allocBits[w] & ~c.markBits[w] & ~c.sharedBits[w];
+            if (!dead)
+                continue;
+            c.allocBits[w] &= ~dead;
+            freed += popcnt(dead);
+            if (firstDead == size_t.max)
+                firstDead = w * bitsPerWord + bsf(dead);
+        }
+
+        if (freed == 0)
+            return;
+
+        c.freeCount += cast(uint) freed;
+        if (firstDead < c.nextFree)
+            c.nextFree = cast(uint) firstDead;
+        immutable size_t bytes = freed * c.slotSize;
+        if (c.region !is null)
+            c.region.usedBytes -= bytes;
+        else
+            usedBytes -= bytes;
+        linkPartial(c);
     }
 
     // -- mark worklist ------------------------------------------------------
@@ -1581,7 +1767,7 @@ private void adoptOrphanChunks(ThreadHeap* dying) nothrow @nogc
 
 // Touched only by the thread that won the globalPending CAS, so no further
 // synchronisation is needed on these.
-private __gshared ChunkMap globalMap;
+private __gshared ChunkDir globalMap;
 private __gshared MarkItem* globalMarkStack;
 private __gshared size_t globalMarkLen;
 private __gshared size_t globalMarkCap;
@@ -1611,10 +1797,14 @@ private void markPtrGlobal(void* p) nothrow
 {
     if (!p)
         return;
-    auto c = globalMap.get(cast(void*)(cast(size_t) p & chunkMask));
+    auto c = globalMap.get(p);
     if (!c)
     {
-        c = globalMap.get(cast(void*)(((cast(size_t) p) - 1) & chunkMask));
+        // Only a chunk-aligned candidate can be one past the end of a block in
+        // the preceding chunk; see ThreadHeap.lookup.
+        if ((cast(size_t) p & (chunkSize - 1)) != 0)
+            return;
+        c = globalMap.get(cast(void*)(cast(size_t) p - 1));
         if (!c)
             return;
     }
@@ -1633,14 +1823,17 @@ private void markPtrGlobal(void* p) nothrow
         if (p < c.data)
             return;
         size_t off = cast(ubyte*) p - cast(ubyte*) c.data;
-        idx = off / c.slotSize;
+        immutable uint off32 = cast(uint) off;
+        immutable uint idx32 = off32 / c.slotSize;
+        idx = idx32;
+        immutable size_t rem = off32 - idx32 * c.slotSize;
         if (idx >= c.slotCount)
         {
-            if (idx != c.slotCount || off % c.slotSize != 0)
+            if (idx != c.slotCount || rem != 0)
                 return;
             idx = c.slotCount - 1;
         }
-        else if (off % c.slotSize == 0 && idx > 0
+        else if (rem == 0 && idx > 0
                  && !c.isAllocated(idx) && c.isAllocated(idx - 1))
         {
             idx--;
@@ -1870,6 +2063,7 @@ private void verifyRegionUnreferenced(ThreadHeap* heap, Region* reg) nothrow
             c.clearMarks();
 
     heap.markLen = 0;
+    heap.memoTi = null;
     heap.verifyRegion = reg;
     heap.verifyHit = null;
 
@@ -2563,8 +2757,8 @@ private:
         // owns the orphan heap: it is mutated only under orphanLock.
         //
         // Another *live* thread's heap is deliberately not searched. Its owner
-        // mutates its chunk map with no lock at all -- and ChunkMap.grow frees
-        // the old key and value arrays -- so probing it from here was a genuine
+        // mutates its chunk directory with no lock at all -- and growing it
+        // frees the old first-level table -- so probing it was a genuine
         // use-after-free, reachable from an ordinary GC.sizeOf on a pointer
         // this thread does not own. Cross-thread sharing is unsupported, so
         // there is nothing to find there anyway.
@@ -2675,6 +2869,7 @@ private:
         heap.collecting = true;
 
         heap.markLen = 0;
+        heap.memoTi = null;
 
         immutable bool trackEscapes = atomicLoad(escapeTracking);
 
@@ -2695,7 +2890,7 @@ private:
                         continue;
                     const(size_t)* bmp;
                     size_t ew;
-                    if (layoutOf(c.meta[idx].ti, a, bmp, ew))
+                    if (heap.layoutCached(c.meta[idx].ti, a, bmp, ew))
                         heap.pushMark(c.slotAt(idx), c.capacity(), bmp, ew);
                 }
             }
@@ -2753,18 +2948,27 @@ private:
             immutable uint count = c.slotCount;
             bool released = false;
 
-            // nextReclaimable tests allocated & ~marked & ~shared 64 slots at
-            // a time, so mostly-live and mostly-free chunks are skipped in a
-            // few instructions. Promoted blocks are excluded: only a global
-            // collection can prove no other thread still holds them.
-            for (size_t idx = c.nextReclaimable(0); idx < count;
-                 idx = c.nextReclaimable(idx + 1))
+            // A chunk with no finalizable slot is swept a word at a time; see
+            // sweepChunkBulk. Otherwise nextReclaimable tests
+            // allocated & ~marked & ~shared 64 slots at a time, so mostly-live
+            // and mostly-free chunks are still skipped in a few instructions.
+            // Promoted blocks are excluded from both: only a global collection
+            // can prove no other thread still holds them.
+            if (!large && !c.hasFinal)
             {
-                heap.freeSlotFinalize(BlkRef(c, idx));
-                if (large)
+                heap.sweepChunkBulk(c);
+            }
+            else
+            {
+                for (size_t idx = c.nextReclaimable(0); idx < count;
+                     idx = c.nextReclaimable(idx + 1))
                 {
-                    released = true;
-                    break;
+                    heap.freeSlotFinalize(BlkRef(c, idx));
+                    if (large)
+                    {
+                        released = true;
+                        break;
+                    }
                 }
             }
 
@@ -3083,7 +3287,7 @@ private:
 
         const(size_t)* bitmap;
         size_t elemWords;
-        if (!layoutOf(c.meta[b.idx].ti, attr, bitmap, elemWords))
+        if (!heap.layoutCached(c.meta[b.idx].ti, attr, bitmap, elemWords))
             return; // the type says there is nothing to find in here
         heap.pushMark(b.payload(), b.capacity(), bitmap, elemWords);
     }
