@@ -15,9 +15,9 @@ driver reports wall time (the parallel section, where the benchmark times one),
 collections, total pause and max pause.
 
 > **The Linux/x86-64 tables below predate the mark-and-sweep optimization pass**
-> described in the last section, and describe the collector as it was before it.
-> They need re-running on that box. The optimization pass itself was measured on
-> macOS/arm64, before and after, and is reported separately.
+> and describe the collector as it was before it. The pass was measured on both
+> platforms afterwards, before and after, and is reported in the last two
+> sections.
 
 ## Baseline (pre-optimization)
 
@@ -170,18 +170,18 @@ do not fix the mark speed — they avoid needing it. Both are worth having: the
 keeps, which regions by definition cannot cover.
 
 
-## Mark and sweep optimization pass
+## Mark and sweep optimization pass — macOS/arm64
 
 Measured on macOS/arm64 -- Apple M1 Pro, LDC 1.42.0, `-O2 -release`, best of 3,
 before and after on the same machine in the same session. These are not
 comparable to the Linux figures above, only to each other.
 
 The starting point was the profile: on this machine `ThreadHeap.freeSlot` was
-the single hottest routine in the collector, ahead of `markPtr`. That was not
-what the Linux `perf` run had said (it put the sweep at 2.6%), and it is the
-reason the changes below are weighted the way they are. **The x86-64 half of
-this is therefore unverified**: the sweep may simply be cheaper there, in which
-case the win will be smaller.
+the single hottest routine in the collector, ahead of `markPtr`, at about 23% of
+samples. That is not what the Linux `perf` run had said -- it put the sweep at
+2.6% -- and the difference turned out to be real rather than a profiling
+artifact: the same change is worth far less on x86-64. Both platforms are
+reported, and the next section is the one to read for x86-64.
 
 ### At a matched 300 MB budget (`bintree_mt 18 1`)
 
@@ -235,11 +235,64 @@ Regions still take the collector nearly out of the request path; what changed is
 that the path they avoid is now much cheaper too, so the gap between "with" and
 "without" narrowed from 32x of total pause to 20x.
 
-### What is left
+## Mark and sweep optimization pass — Linux/x86-64
 
-Marking is now unambiguously the top cost -- `markPtr`, `lookup` and
-`drainMarkStack` together are about a third of runtime on binary-trees, against
-a sweep that has all but vanished from the profile. What remains there is the
-conservative scan itself and the cache misses inherent in chasing pointers
-through a heap, not the data structure around it. See `IMPROVEMENTS.md` for the
-four explanations already tested and rejected, now six.
+Same box as the tables at the top -- AMD EPYC 9645, 8 cores with roughly one
+already busy, Debian 13, LDC 1.42.0, `-O2 -release`. Before and after were run
+*interleaved*, alternating the two binaries so that drift in machine load hits
+both equally, best of 5. The pre-change column reproduces the published figures
+above to within a few percent (binary-trees depth 18: 4.844 s here against
+5.183 s there), so the two are comparable.
+
+### At a matched 300 MB budget (`bintree_mt 18 1`)
+
+| | collections | total pause | max pause | parallel section |
+|---|---|---|---|---|
+| conservative | 7 | 122.0 ms | 39.45 ms | 1.667 s |
+| tgc, before | 7 | 750.5 ms | 135.68 ms | 2.570 s |
+| **tgc, after** | 7 | **344.2 ms** | **59.34 ms** | **1.986 s** |
+
+This is the number that matters: on the same live set and the same seven
+collections, tgc's pause per collection went from about **6x** the default
+collector's to about **2.8x**, and its worst pause from 3.4x to 1.5x.
+
+### Everything else
+
+| | wall | collections | total pause | max pause |
+|---|---|---|---|---|
+| bintree d18, conservative | 1.834 s | 7 | 130.3 ms | 33.41 ms |
+| bintree d18, tgc before | 4.844 s | 64 | 2876.9 ms | 72.17 ms |
+| bintree d18, tgc after | **4.267 s** | 64 | **2379.4 ms** | **65.76 ms** |
+| mt d18 x4, tgc before | 1.636 s | 26 | 2145.3 ms | 134.47 ms |
+| mt d18 x4, tgc after | **1.431 s** | 26 | **1005.9 ms** | **69.04 ms** |
+| region d18 x4, before | 1.650 s | 5 | 99.1 ms | 51.60 ms |
+| region d18 x4, after | **1.537 s** | 5 | **68.2 ms** | **35.33 ms** |
+
+### Why the two platforms disagree by so much
+
+At a matched budget the pause win is 21x on arm64 and 2.2x on x86-64, and the
+reason is visible in `perf`: before the change the sweep was 2.8% of runtime on
+x86-64 (`freeSlot`) plus part of `collectHeap`'s 5.6%, against roughly 23% of
+samples on arm64. The per-object metadata stores that the bulk sweep removes are
+simply much cheaper on this machine.
+
+Where the time goes now, binary-trees depth 18 (`perf`, self time):
+
+| | before | after |
+|---|---|---|
+| marking (`drainMarkStack` + `markPtr` + `lookup`) | 41.5% | 45.4% |
+| allocation (`allocSlot` + `alloc`) | 12.3% | 13.0% |
+| sweep (`freeSlot` + `collectHeap`) | 8.4% | below 1.5%, unlisted |
+| kernel page management | 6.6% | 8.2% |
+
+Marking grew as a *share* because everything around it got cheaper; in absolute
+terms it is unchanged, which is the point of the next section.
+
+## What is left
+
+Marking is now unambiguously the top cost on both platforms -- `markPtr`,
+`lookup` and `drainMarkStack` together are 45% of runtime on x86-64, against a
+sweep that has dropped off the profile. What remains there is the conservative
+scan itself and the cache misses inherent in chasing pointers through a heap,
+not the data structure around it. See `IMPROVEMENTS.md` for the explanations
+already tested and rejected -- four before this pass, six now.

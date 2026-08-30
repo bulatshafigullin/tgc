@@ -119,17 +119,26 @@ needed — `alloc` rewrites both fields on every slot it hands out, and nothing
 reads either for an unallocated slot.
 
 A chunk holding no finalizable slot is now swept a word at a time. At a matched
-300 MB budget on binary-trees depth 18, total pause went from 436 ms to 20 ms
-across the same seven collections, which is *below* the default collector's
-31 ms on the same live set. See `BENCHMARKS.md`.
+300 MB budget on binary-trees depth 18, across the same seven collections:
 
-Two caveats, both worth keeping visible:
+| | arm64 pause | x86-64 pause |
+|---|---|---|
+| conservative | 31.1 ms | 122.0 ms |
+| tgc, before | 435.6 ms | 750.5 ms |
+| tgc, after | **20.4 ms** | **344.2 ms** |
 
-* **This is measured on arm64 only.** The Linux `perf` run that produced the
-  original conclusion put the sweep at 2.6% of runtime, not the ~23% of samples
-  seen here. Re-running `bench/run.sh` on the Linux box is the first thing to do
-  with this change; the win there may be much smaller.
-* The `perf` share attributed to kernel page management (7.8%) and the
+So the *direction* held on both platforms and the magnitude did not: 21x on
+arm64, 2.2x on x86-64. The `perf` numbers explain it -- before the change the
+sweep was 2.8% of runtime on x86-64 plus part of `collectHeap`'s 5.6%, against
+roughly 23% of samples on arm64, so the per-object metadata stores the bulk
+sweep removes were simply much cheaper there. Both runs are in `BENCHMARKS.md`.
+
+Two things this leaves:
+
+* **On x86-64 tgc still costs about 2.8x the default collector per collection**
+  on the same live set, down from about 6x. That is the remaining gap, and it is
+  now the mark phase almost entirely -- see item 0.
+* The `perf` share attributed to kernel page management (now 8.2%) and the
   free-chunk cache that failed to fix it are unaffected by any of this, and
   remain explained as first-touch faulting of a growing heap.
 
@@ -142,9 +151,11 @@ Two caveats, both worth keeping visible:
   stored per chunk or looked up per size class. M1's divider is fast enough that
   the multiply chain is a longer dependency than the divide it replaces. The
   division is now done in 32 bits instead (a small chunk run is at most 256 KB,
-  so the offset fits), which is free here and should halve its latency on
-  x86-64, where the original argument may still hold.
-* **Skipping the per-slot `TypeInfo` load while marking.** Marking loads
+  so the offset fits), which is free on arm64 and cheaper on x86-64, where the
+  divider is slower. Whether a reciprocal would pay *there* is untested; it
+  would have to be measured on that box before being believed.
+* **Skipping the per-slot `TypeInfo` load while marking** (measured on arm64).
+  Marking loads
   `meta[idx].ti` per object from a 16-byte-per-slot side array — the coldest
   touch on the path. Caching one type per chunk (correct only when a chunk is
   single-typed, which is common) was measured as an upper bound by hardcoding it:

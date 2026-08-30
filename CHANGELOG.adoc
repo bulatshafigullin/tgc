@@ -63,10 +63,12 @@ The flag deciding it is per *chunk* and sticky, so a chunk that has ever held a
 finalizable slot keeps the per-slot path for all of it; a chunk holding a mix
 never takes the bulk path. `test/tgc_safety.d` covers that case directly.
 +
-This was the largest single win in the pass. At a 300 MB budget on
-binary-trees depth 18, total pause fell from 436 ms to 20 ms across the same
-seven collections -- *below* the default collector's 31 ms on the same live set,
-where tgc had been 14x above it.
+This was the largest single win in the pass, and how large depends sharply on
+the machine. At a 300 MB budget on binary-trees depth 18, across the same seven
+collections, total pause fell from 436 ms to 20 ms on arm64 -- *below* the
+default collector's 31 ms on the same live set -- and from 751 ms to 344 ms on
+x86-64, where the default collector spends 122 ms. The per-object metadata
+stores this removes were 23% of samples on arm64 and under 8% on x86-64.
 
 * *Chunks are indexed by address rather than hashed.* The chunk map was an
   open-addressed hash table, and after `markPtr` itself it was the most
