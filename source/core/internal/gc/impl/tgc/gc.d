@@ -25,7 +25,7 @@ module core.internal.gc.impl.tgc.gc;
 
 import core.gc.gcinterface;
 
-import core.atomic : atomicLoad, atomicOp, atomicStore;
+import core.atomic : atomicLoad, atomicOp, atomicStore, MemoryOrder;
 import core.internal.container.array;
 import core.internal.spinlock;
 import core.internal.traits : externDFunc;
@@ -489,7 +489,7 @@ private struct Chunk
     size_t* sharedBits; /// slot escaped through a global (sticky)
     ubyte* attrs;       /// BlkAttr, one byte per slot
     void* data;      /// first slot
-    void* freeHead;  /// intrusive free-slot list, threaded through free slots
+    uint nextFree;   /// where to resume searching allocBits for a free slot
 
     uint slotSize;
     uint slotCount;
@@ -528,6 +528,44 @@ private struct Chunk
 
     uint attrOf(size_t i) const nothrow @nogc { return attrs[i]; }
     void setAttrOf(size_t i, uint a) nothrow @nogc { attrs[i] = cast(ubyte)(a & keptAttrs); }
+
+    /**
+     * Index of the first unallocated slot at or after `from`; `slotCount` when
+     * the chunk is full.
+     *
+     * Allocation used to pop an intrusive free list threaded through the free
+     * slots themselves, which meant every free wrote into the dead object's
+     * memory — cold, and the single hottest operation in the collector under
+     * profiling. The allocation bitmap already records the same information
+     * and is dense, so a free is now just a cleared bit and nothing touches
+     * the payload.
+     */
+    size_t firstFree(size_t from) const nothrow @nogc
+    {
+        immutable size_t words = bitWords(slotCount);
+        size_t w = from / bitsPerWord;
+        if (w >= words)
+            return slotCount;
+
+        size_t bits = ~allocBits[w];
+        immutable size_t off = from % bitsPerWord;
+        if (off)
+            bits &= ~cast(size_t) 0 << off;
+
+        for (;;)
+        {
+            if (bits)
+            {
+                import core.bitop : bsf;
+
+                size_t idx = w * bitsPerWord + bsf(bits);
+                return idx < slotCount ? idx : slotCount;
+            }
+            if (++w >= words)
+                return slotCount;
+            bits = ~allocBits[w];
+        }
+    }
 
     /// Like `nextReclaimable`, but ignores promotion: a global collection has
     /// already proven reachability, so the sticky bit must not veto it.
@@ -931,20 +969,12 @@ private struct ThreadHeap
         c.slotSize = slotSize;
         c.slotCount = cast(uint) count;
         c.freeCount = cast(uint) count;
+        c.nextFree = 0;
         c.cls = cls;
         c.runChunks = units;
 
         // One wipe covers the bitvectors, the attribute bytes and the metadata.
         memset(cast(ubyte*) raw + bitsOff, 0, dataOff - bitsOff);
-
-        // Thread the free list through the slots themselves.
-        c.freeHead = null;
-        foreach_reverse (i; 0 .. count)
-        {
-            auto slot = c.slotAt(i);
-            *cast(void**) slot = c.freeHead;
-            c.freeHead = slot;
-        }
 
         foreach (i; 0 .. units)
             map.put(cast(void*)(cast(ubyte*) raw + i * chunkSize), c);
@@ -1150,14 +1180,13 @@ private struct ThreadHeap
         if (!c)
             c = newSmallChunk(cls);
 
-        auto slot = c.freeHead;
-        assert(slot !is null, "tgc: partial chunk has no free slot");
-        c.freeHead = *cast(void**) slot;
+        size_t idx = c.firstFree(c.nextFree);
+        assert(idx < c.slotCount, "tgc: partial chunk has no free slot");
+        c.nextFree = cast(uint)(idx + 1);
         c.freeCount--;
         if (c.freeCount == 0)
             unlinkPartial(c);
 
-        size_t idx = (cast(ubyte*) slot - cast(ubyte*) c.data) / c.slotSize;
         c.setAllocated(idx);
         if (birthMarked)
             c.setMarked(idx);
@@ -1180,9 +1209,8 @@ private struct ThreadHeap
             return;
         }
 
-        auto slot = c.slotAt(b.idx);
-        *cast(void**) slot = c.freeHead;
-        c.freeHead = slot;
+        if (b.idx < c.nextFree)
+            c.nextFree = cast(uint) b.idx;
         c.freeCount++;
         usedBytes -= c.slotSize;
         linkPartial(c);
@@ -2164,7 +2192,8 @@ private:
     BlkRef alloc(size_t size, uint bits, bool zero, const TypeInfo ti) nothrow
     {
         auto heap = currentHeap();
-        if (atomicLoad(disabled) <= 0 && heap.usedBytes >= heap.collectThreshold)
+        // Cheap test first; the atomic is only consulted when a collection looms.
+        if (heap.usedBytes >= heap.collectThreshold && atomicLoad!(MemoryOrder.raw)(disabled) <= 0)
         {
             collectHeap(heap, Trigger.automatic);
 
@@ -2185,11 +2214,11 @@ private:
         m.usedSize = (bits & BlkAttr.APPENDABLE) ? size : 0;
 
         auto p = b.payload();
-        // Always zero: slots are recycled, so stale bytes would otherwise be
-        // handed back as uninitialised data, and any stale pointer left in
-        // them would be treated as a live reference by the conservative mark
-        // phase and retain dead blocks indefinitely.
-        memset(p, 0, b.capacity());
+        // Zero only when asked, as druntime's own collector does. Zeroing every
+        // allocation cost a memset on the hot path for data the runtime
+        // immediately overwrites with a type initialiser.
+        if (zero)
+            memset(p, 0, b.capacity());
 
         heap.allocatedTotal += size;
         assert((cast(size_t) p & (payloadAlign - 1)) == 0,

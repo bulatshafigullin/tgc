@@ -106,6 +106,23 @@ reachable and untested — is the worst of the three.
 
 ## Open — smaller items
 
+### 0. Marking is now the bottleneck, and it is conservative scanning itself
+
+With the free list gone, the self-time profile on binary-trees is `markPtr`
+(592 samples) plus `lookup` (418) against `alloc` (333) and `allocSlot` (290).
+Two cheap explanations were tested and both rejected by measurement:
+
+* a one-entry chunk cache in front of the map hit only 48% — marking a tree
+  jumps between chunks more than expected, and the bookkeeping cost more than
+  the hit saved;
+* growing the chunk size from 64 KiB to 1 MiB, so the chunk map stays in L1,
+  bought 6% (2.30 s to 2.15 s).
+
+So the remaining gap against druntime's collector is the conservative scan
+itself, not the data structure around it. The next real lever is precise
+scanning for blocks with a known pointer map (item 8), which would let marking
+skip words that cannot be pointers rather than probing each one.
+
 ### 2. Escape tracking still defaults to off
 
 Phase 2 reclaims both adopted arenas and promoted blocks, so retention is no

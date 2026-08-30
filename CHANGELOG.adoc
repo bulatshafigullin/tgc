@@ -50,6 +50,22 @@ use those objects. See `CROSS-THREAD.md`.
 
 === Changed — performance
 
+* *Allocation uses the bitmap instead of an intrusive free list*, and no longer
+  zeroes every block. Profiling binary-trees put `freeSlot` at the top of the
+  self-time histogram, ahead of marking: the free list was threaded through the
+  free slots themselves, so every reclaimed object took a write into cold, dead
+  memory. The allocation bitmap already records exactly the same information,
+  so a free is now a cleared bit and nothing touches the payload; allocation
+  finds the next clear bit from a per-chunk cursor.
++
+Blocks are also only zeroed when `calloc` asks, matching druntime -- the
+unconditional `memset` was clearing data the runtime overwrote immediately with
+a type initialiser -- and the `disabled` check is ordered after the cheap
+threshold test and relaxed to a raw atomic load.
++
+Allocation went from 20.03 ns to 11.03 ns; binary-trees depth 18 from 2.29 s to
+2.03 s and depth 20 from 10.35 s to 9.32 s.
+
 * *Fiber enumeration walks the global context list once instead of twice*, with
   the cheap rejections first. Scanning was already restricted to the collecting
   thread's own fibers; finding them still means walking druntime's global list,
