@@ -106,6 +106,21 @@ reachable and untested — is the worst of the three.
 
 ## Open — smaller items
 
+### -2. Marking is ~6x slower per collection than druntime's, and chunk churn costs 8%
+
+Measured on Linux/x86-64 (see `BENCHMARKS.md`). At a matched collection count on
+an identical live set, tgc spends 1217 ms of pause against the default
+collector's 138 ms. `perf` puts 38.7% of runtime in marking
+(`drainMarkStack`/`markPtr`/`lookup`) — this is the single largest gap the
+project has, and three cheap explanations have already been tested and rejected:
+a one-entry chunk cache (48% hit, cost more than it saved), 1 MiB chunks so the
+map stays in L1 (6%), and precise scanning (4–6%, already shipped).
+
+Separately and more tractably, 7.8% of runtime is *kernel page management* —
+`clear_page_erms` and `folio_*`. `releaseChunk` hands empty 64 KiB chunks back
+to the allocator on every sweep and the next allocation faults them in again. A
+small free-chunk cache should remove most of that, and is a bounded change.
+
 ### -1. Regions do not nest, and a throw out of one is a trap
 
 `tgcBeginRegion` returns null on a fiber that already has a region open, because
