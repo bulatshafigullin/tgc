@@ -338,6 +338,13 @@ across compilers, and an under-scan here means freeing live memory rather than
 a visible failure. `tgcPreciseScanning(false)` turns it off; the DMD leg of CI
 is the first real cross-compiler check.
 
+That leg has now run, and it found two *test* bugs rather than a precision one:
+a region opened and discarded on the main thread, and the `keepAlive` barrier
+publishing a region block to a `__gshared` slot inside a verified region. Both
+reproduced only under DMD, because module order there runs the region tests
+first. Precise scanning itself came through clean under DMD on Linux and
+Windows, in both the debug and optimized builds.
+
 Note that full concurrency in FUGC's sense is *not* reachable: it depends on a
 Dijkstra store barrier, and D has no write barrier without compiler support.
 That is also why the sampled-promotion hole in `CROSS-THREAD.md` cannot be

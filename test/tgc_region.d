@@ -202,12 +202,21 @@ unittest
 
 unittest
 {
-    // Allocation outside any region is unaffected.
-    assert(tgcBeginRegion() is null || true);
+    // Allocation outside any region is unaffected -- it lands in the thread
+    // heap and shows up in the thread heap's accounting.
+    //
+    // This used to open a region here and throw the handle away, on the
+    // assumption that `tgcBeginRegion` returns null off a fiber. It does not:
+    // the main thread has a stack context like any other, so the call
+    // succeeded and left a region open on this thread for the rest of the
+    // process. Every later allocation was then routed into it, and two
+    // accounting tests in *other* modules failed -- under DMD only, because
+    // module order there puts this one first.
     auto before = GC.stats().usedSize;
     auto b = new ubyte[4096];
     b[0] = 1;
-    assert(GC.stats().usedSize >= before);
+    assert(GC.stats().usedSize > before,
+        "an allocation outside a region did not grow the thread heap");
     keepAlive(b.ptr);
 }
 
@@ -223,18 +232,25 @@ unittest
     tgcRegionVerify(true);
     scope (exit) tgcRegionVerify(false);
 
+    // Deliberately *not* `keepAlive` here. On compilers without the inline-asm
+    // barrier it stores the pointer into a __gshared slot, which publishes a
+    // region block to a global -- exactly the escape the next test checks the
+    // verifier for. Feeding a local sum keeps the allocations from being
+    // elided without letting anything out of the region.
+    int sum;
     auto f = new Fiber({
         tgcRunInRegion({
             foreach (i; 0 .. 100)
             {
                 auto b = new ubyte[128];
                 b[0] = cast(ubyte) i;
-                keepAlive(b.ptr);
+                sum += b[0];
             }
         });
     });
     f.call();
     assert(f.state == Fiber.State.TERM);
+    assert(sum == 4950, "the region body did not run");
 }
 
 unittest

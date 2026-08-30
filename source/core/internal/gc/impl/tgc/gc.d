@@ -2575,6 +2575,11 @@ private void verifyRegionUnreferenced(ThreadHeap* heap, Region* reg) nothrow
     for (auto r = heap.regions; r; r = r.next)
         for (auto c = r.chunks; c; c = c.nextAll)
             c.clearMarks();
+    // The region under test is already unlinked from the heap, so the loop
+    // above does not reach it. A stale mark on one of its blocks would make
+    // markPtr return before it could record the inbound reference.
+    for (auto c = reg.chunks; c; c = c.nextAll)
+        c.clearMarks();
 
     heap.markLen = 0;
     heap.memoTi = null;
@@ -2652,10 +2657,14 @@ extern (C) void tgc_endRegion(void* handle) nothrow
 
     auto heap = reg.owner;
 
-    if (atomicLoad(regionVerify))
-        verifyRegionUnreferenced(heap, reg);
-
-    // Unlink from the heap first, so nothing routes into it while it drains.
+    // Unlink from the heap first, so nothing routes into it while it drains --
+    // and *before* verification, because the verifier reports by asserting. A
+    // region still linked when that assert unwinds stays current for this
+    // fiber, so every later allocation on the thread is routed into memory the
+    // caller believes is gone, and `GC.stats().usedSize` stops moving. That is
+    // how one failing verification turned into two unrelated accounting
+    // failures elsewhere in the suite, under DMD only, where module order put
+    // the region tests first.
     Region** pp = &heap.regions;
     while (*pp !is null && *pp !is reg)
         pp = &(*pp).next;
@@ -2663,6 +2672,18 @@ extern (C) void tgc_endRegion(void* handle) nothrow
         *pp = reg.next;
     heap.cachedCtx = null;
     heap.cachedRegion = null;
+
+    if (atomicLoad(regionVerify))
+    {
+        // The region is unlinked already, so if verification throws it must
+        // also stop counting as active -- otherwise every later allocation on
+        // every thread pays the region lookup for a region nothing can reach.
+        // Its memory is deliberately *not* freed: something outside still
+        // points into it, which is what the verifier just said.
+        scope (failure)
+            atomicOp!"-="(activeRegions, 1);
+        verifyRegionUnreferenced(heap, reg);
+    }
 
     heap.finalizing = true;
     auto c = reg.chunks;

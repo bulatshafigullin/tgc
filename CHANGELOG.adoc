@@ -47,6 +47,23 @@ use those objects. See `CROSS-THREAD.md`.
 * `removeRoot`/`removeRange` no longer `assert(false)` — that halted the
   process in release builds when removing an unknown root.
 * `runFinalizers(segment)` is implemented instead of being a no-op.
+* *A region is unlinked from its heap before it is verified, not after.* The
+  verifier reports by asserting, and a region still linked when that assert
+  unwound stayed current for the fiber -- so every later allocation on the
+  thread was routed into memory the caller believed was gone, and
+  `GC.stats().usedSize` stopped moving. It also no longer counts as active once
+  verification fails. Its memory is still deliberately not freed: something
+  outside points into it, which is what the verifier just said.
++
+Two test bugs came out of the same investigation, both of which only showed up
+under DMD, where module order runs the region tests first. One opened a region
+and threw the handle away -- `tgcBeginRegion` returns null only when there is no
+stack context, and the main thread has one like any other -- leaving a region
+open for the rest of the process. The other used the `keepAlive` barrier inside
+a verified region; on compilers without the inline-asm form it stores into a
+`__gshared` slot, which publishes a region block to a global and is precisely
+the escape the verifier exists to catch. The verifier was right both times.
+
 * *The retained-bytes total is no longer published with a plain store.*
   `collectGlobal` re-derived `orphanBytes` from the orphan heap after resuming
   the world, outside `orphanLock` and without an atomic, racing
