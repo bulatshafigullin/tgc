@@ -50,6 +50,57 @@ use those objects. See `CROSS-THREAD.md`.
 
 === Changed — performance
 
+* *A chunk that holds no finalizable slot is swept a word at a time.*
+  Reclaiming a slot used to cost a 16-byte `SlotMeta` store, an attribute-byte
+  store and two bit updates, per dead object, on cold lines -- and a walk of the
+  allocation bitmap per object rather than per word. None of that is needed:
+  `alloc` overwrites the metadata and attributes of every slot it hands out, and
+  nothing reads either for a slot that is not allocated. With no destructor to
+  run, reclaiming a slot is exactly clearing its allocation bit, and 64 of those
+  clear in one `AND`.
++
+The flag deciding it is per *chunk* and sticky, so a chunk that has ever held a
+finalizable slot keeps the per-slot path for all of it; a chunk holding a mix
+never takes the bulk path. `test/tgc_safety.d` covers that case directly.
++
+This was the largest single win in the pass. At a 300 MB budget on
+binary-trees depth 18, total pause fell from 436 ms to 20 ms across the same
+seven collections -- *below* the default collector's 31 ms on the same live set,
+where tgc had been 14x above it.
+
+* *Chunks are indexed by address rather than hashed.* The chunk map was an
+  open-addressed hash table, and after `markPtr` itself it was the most
+  expensive thing in the collector: every candidate word scanned -- most of
+  which are not pointers at all -- paid a 64-bit mixer and a random probe into a
+  table that at a 74 MB live set is exactly L1-sized, so marking missed cache on
+  the *metadata* before it ever touched the object.
++
+It is now a two-level directory indexed by the address itself. A candidate
+outside the heap's address span is rejected in two compares without touching
+memory; chunks adjacent in memory land on adjacent entries, so a tree walk
+streams the directory instead of thrashing it; and an entry is a `uint` rather
+than a `Chunk*`, because a chunk's header lives at its own base, which removes
+the second dependent load a hash map needs.
++
+Marking also stopped probing twice for every miss. The one-past-the-end retry
+re-probed with `p - 1` whenever the first probe failed, but `p` and `p - 1` are
+in the same chunk unless `p` is exactly chunk-aligned, so the retry is now
+conditional on that.
+
+* *Size classes resolve through a table*, not a linear scan over 40 entries on
+  every allocation. Worth 5% of wall time on binary-trees.
+
+* *Pointer-map lookups are memoised.* Marking a block resolves its layout
+  through a virtual call into `TypeInfo.rtInfo`; types repeat heavily within one
+  heap, so a one-entry memo removes nearly all of it. Worth 3% of pause. The
+  memo is cleared at the start of every collection, so a change to
+  `tgcPreciseScanning` between two of them cannot be missed.
+
+* *Benchmarks are in the repository.* `dub build -c bench-bintree|bench-mt|bench-region`
+  and `bench/run.sh` build the three binary-trees variants and run each under
+  both collectors, reporting wall time, collections and pause distribution.
+  See `BENCHMARKS.md`.
+
 * *Precise scanning via `TypeInfo.rtInfo` pointer maps* (`tgcPreciseScanning`,
   on by default). Marking consults the compiler-emitted map for a block and
   probes only the words that can hold a reference: for a class with two

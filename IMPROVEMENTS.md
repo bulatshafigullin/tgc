@@ -19,11 +19,12 @@ accounting, atomics on cross-thread state, unattached-thread collection refusal,
 
 Performance: chunk-arena allocator with O(1) pointer resolution, explicit mark
 worklist, array API implementation, threshold decay, chunk release, root
-snapshotting, pause-time instrumentation.
+snapshotting, pause-time instrumentation, **word-at-a-time sweeping**,
+**address-indexed chunk directory**, size-class table, pointer-map memo.
 
 Infrastructure: UTF-8 conversion, `.gitattributes`, CI (DMD/LDC ×
 Linux/macOS/Windows + sanitizers + encoding guard), adversarial test suite,
-optimized test build.
+optimized test build, **in-repo benchmarks** (`bench/run.sh`).
 
 Measured collection time, N live 32-byte objects:
 
@@ -106,36 +107,49 @@ reachable and untested — is the worst of the three.
 
 ## Open — smaller items
 
-### -2. Marking is ~6x slower per collection than druntime's, and chunk churn costs 8%
+### -2. The sweep, not the mark, was the largest cost — and it is fixed
 
-Measured on Linux/x86-64 (see `BENCHMARKS.md`). At a matched collection count on
-an identical live set, tgc spends 1217 ms of pause against the default
-collector's 138 ms. `perf` puts 38.7% of runtime in marking
-(`drainMarkStack`/`markPtr`/`lookup`) — this is the single largest gap the
-project has, and three cheap explanations have already been tested and rejected:
-a one-entry chunk cache (48% hit, cost more than it saved), 1 MiB chunks so the
-map stays in L1 (6%), and precise scanning (4–6%, already shipped).
+The earlier reading of this — "marking is ~6x slower per collection than
+druntime's" — was mostly wrong, and profiling on a second platform is what
+showed it. On macOS/arm64 the hottest routine in the collector was
+`ThreadHeap.freeSlot`, ahead of `markPtr`: reclaiming a slot cost a 16-byte
+metadata store, an attribute store and two bit updates per dead object, all on
+cold lines, plus a bitmap walk per object rather than per word. None of it was
+needed — `alloc` rewrites both fields on every slot it hands out, and nothing
+reads either for an unallocated slot.
 
-**Tried and rejected: a free-chunk cache.** `perf` puts 7.8% of runtime in
-kernel page management (`clear_page_erms`, `folio_*`), which looked like chunk
-churn — `releaseChunk` returning empty 64 KiB chunks and the next allocation
-faulting them back in. Holding 16 chunks back per thread, including on region
-teardown where churn is heaviest, moved nothing:
+A chunk holding no finalizable slot is now swept a word at a time. At a matched
+300 MB budget on binary-trees depth 18, total pause went from 436 ms to 20 ms
+across the same seven collections, which is *below* the default collector's
+31 ms on the same live set. See `BENCHMARKS.md`.
 
-| workload | no cache | with cache |
-|---|---|---|
-| binary-trees d18 | 5.183 s | 5.174 s |
-| region benchmark, no regions | 0.105 s | 0.103 s |
-| region benchmark, regions | 0.058 s | 0.058 s |
+Two caveats, both worth keeping visible:
 
-The cache was genuinely being used — 65% hit rate on the non-region path — so
-chunk allocation and freeing simply are not expensive at these rates. The kernel
-page time must come from faulting in the heap as it *grows* to its steady size,
-which no cache can avoid. Reverted rather than carry 30 lines and a delayed
-memory-return for ~2%.
+* **This is measured on arm64 only.** The Linux `perf` run that produced the
+  original conclusion put the sweep at 2.6% of runtime, not the ~23% of samples
+  seen here. Re-running `bench/run.sh` on the Linux box is the first thing to do
+  with this change; the win there may be much smaller.
+* The `perf` share attributed to kernel page management (7.8%) and the
+  free-chunk cache that failed to fix it are unaffected by any of this, and
+  remain explained as first-touch faulting of a growing heap.
 
-That leaves marking as the only lever worth pulling here, and four cheap
-explanations for it have now been tested and rejected.
+### -2b. Experiments that did not pay, this pass
+
+* **Multiply-by-reciprocal for the slot-index division.** `idx = off / slotSize`
+  is on the hottest path and `slotSize` is a runtime value, so the compiler emits
+  a real divide. Replacing it with a 42-bit fixed-point reciprocal measured
+  *slower* on arm64 — 595 ms of pause against 560 ms — whether the reciprocal was
+  stored per chunk or looked up per size class. M1's divider is fast enough that
+  the multiply chain is a longer dependency than the divide it replaces. The
+  division is now done in 32 bits instead (a small chunk run is at most 256 KB,
+  so the offset fits), which is free here and should halve its latency on
+  x86-64, where the original argument may still hold.
+* **Skipping the per-slot `TypeInfo` load while marking.** Marking loads
+  `meta[idx].ti` per object from a 16-byte-per-slot side array — the coldest
+  touch on the path. Caching one type per chunk (correct only when a chunk is
+  single-typed, which is common) was measured as an upper bound by hardcoding it:
+  550 ms of pause to 530 ms, 3.6%. Not worth a per-chunk uniform-type invariant
+  that has to stay correct through `realloc` and `setAttr`.
 
 ### -1. Regions do not nest, and a throw out of one is a trap
 
@@ -153,20 +167,29 @@ not solved.
 
 ### 0. Marking is now the bottleneck, and it is conservative scanning itself
 
-With the free list gone, the self-time profile on binary-trees is `markPtr`
-(592 samples) plus `lookup` (418) against `alloc` (333) and `allocSlot` (290).
-Two cheap explanations were tested and both rejected by measurement:
+With the sweep gone from the profile, `markPtr` + `lookup` + `drainMarkStack`
+are about a third of runtime on binary-trees, and nothing else in the collector
+is close. Six cheap explanations have now been tested:
 
-* a one-entry chunk cache in front of the map hit only 48% — marking a tree
-  jumps between chunks more than expected, and the bookkeeping cost more than
-  the hit saved;
-* growing the chunk size from 64 KiB to 1 MiB, so the chunk map stays in L1,
-  bought 6% (2.30 s to 2.15 s).
+| tried | result |
+|---|---|
+| one-entry chunk cache in front of the map | 48% hit, cost more than it saved |
+| 64 KiB → 1 MiB chunks, so the map stays in L1 | 6% |
+| precise scanning via `rtInfo` | 4–6%, shipped |
+| free-chunk cache, to cut kernel page management | 0.2% |
+| multiply-by-reciprocal instead of a divide | *negative* on arm64 |
+| per-chunk uniform `TypeInfo`, to skip a cold load | 3.6% upper bound, not taken |
 
-So the remaining gap against druntime's collector is the conservative scan
-itself, not the data structure around it. The next real lever is precise
-scanning for blocks with a known pointer map (item 8), which would let marking
-skip words that cannot be pointers rather than probing each one.
+What *did* pay was replacing the hash map with an address-indexed directory
+(shipped) — a candidate outside the heap's span is now rejected in two compares
+with no memory touched, and adjacent chunks land on adjacent entries.
+
+What is left is the conservative scan itself and the cache misses inherent in
+chasing pointers through a large heap. The next real levers are structural:
+interleaving the per-chunk `allocBits`/`markBits`/`sharedBits` so marking touches
+one line instead of two, moving `NO_SCAN` out of the byte-per-slot attribute
+array into a bitvector, and prefetching down the mark stack. All three are worth
+measuring; none is obviously worth its complexity yet.
 
 ### 2. Escape tracking still defaults to off
 
@@ -248,12 +271,15 @@ Pre-committing arena chunks for a requested size would let latency-sensitive
 callers pay the allocation cost up front. `extend()` now reports usable slack
 but cannot grow a slot.
 
-### 7. Benchmarks are not in the repo
+### 7. Benchmarks are in the repo, but not in CI
 
-The numbers above come from throwaway probes. A `bench/` target comparing tgc
-against `conservative` on pause distribution, N-thread scaling and allocation
-throughput belongs in the repository, ideally tracked in CI so a regression in
-the mark phase is visible.
+`dub build -c bench-bintree|bench-mt|bench-region` and `bench/run.sh` build the
+three binary-trees variants and run each under both collectors, reporting wall
+time, collections and pause distribution; `BENCHMARKS.md` records the numbers.
+What is still missing is CI: nothing fails when a change makes the mark phase
+slower, and a shared runner's timings are noisy enough that the threshold needs
+thought. Pause *per collection* on a fixed live set is the most stable metric to
+gate on.
 
 ### 8. Precise scanning is on, but is the newest and least-proven feature
 

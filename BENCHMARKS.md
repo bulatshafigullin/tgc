@@ -1,5 +1,26 @@
 # binary-trees benchmark
 
+## Running them
+
+```
+bench/run.sh                # depth 18, best of 3, all three variants
+bench/run.sh -d 16 -r 1     # quicker
+bench/run.sh -b bintree     # one variant
+```
+
+Each variant is a dub configuration (`bench-bintree`, `bench-mt`,
+`bench-region`) that links tgc in, so the collector is chosen at runtime with
+`--DRT-gcopt=gc:` and both columns of a comparison run the same binary. The
+driver reports wall time (the parallel section, where the benchmark times one),
+collections, total pause and max pause.
+
+> **The Linux/x86-64 tables below predate the mark-and-sweep optimization pass**
+> described in the last section, and describe the collector as it was before it.
+> They need re-running on that box. The optimization pass itself was measured on
+> macOS/arm64, before and after, and is reported separately.
+
+## Baseline (pre-optimization)
+
 Measured on an unloaded Linux/x86-64 box — AMD EPYC 9645, 8 cores available,
 Debian 13, LDC 1.42.0, `-O2 -release`. One binary per benchmark with tgc linked
 in; the collector is chosen at runtime via `--DRT-gcopt=gc:`, so both columns
@@ -147,3 +168,78 @@ Regions are what make the collector nearly disappear from the request path. They
 do not fix the mark speed — they avoid needing it. Both are worth having: the
 6× per-collection gap still governs whatever long-lived data a real program
 keeps, which regions by definition cannot cover.
+
+
+## Mark and sweep optimization pass
+
+Measured on macOS/arm64 -- Apple M1 Pro, LDC 1.42.0, `-O2 -release`, best of 3,
+before and after on the same machine in the same session. These are not
+comparable to the Linux figures above, only to each other.
+
+The starting point was the profile: on this machine `ThreadHeap.freeSlot` was
+the single hottest routine in the collector, ahead of `markPtr`. That was not
+what the Linux `perf` run had said (it put the sweep at 2.6%), and it is the
+reason the changes below are weighted the way they are. **The x86-64 half of
+this is therefore unverified**: the sweep may simply be cheaper there, in which
+case the win will be smaller.
+
+### At a matched 300 MB budget (`bintree_mt 18 1`)
+
+The comparison the collector should be judged on: same heap budget, same live
+set, same collection count, one thread.
+
+| | collections | total pause | max pause | parallel section |
+|---|---|---|---|---|
+| conservative | 7 | 31.1 ms | 6.77 ms | 1.205 s |
+| tgc, before | 7 | 435.6 ms | 74.03 ms | 1.330 s |
+| **tgc, after** | 7 | **20.4 ms** | **4.07 ms** | **0.823 s** |
+
+Total pause fell 21x, and per collection tgc is now *below* the default
+collector on the same live set rather than 14x above it. The earlier conclusion
+-- "about 6x more expensive per collection" -- was mostly the sweep, not the
+mark.
+
+### Four workers (`bintree_mt 18 4`)
+
+| | collections | total pause | max pause | parallel section |
+|---|---|---|---|---|
+| conservative | 8 | 110.0 ms | 23.61 ms | 3.498 s |
+| tgc, before | 25 | 478.6 ms | 21.12 ms | 0.354 s |
+| **tgc, after** | 25 | **66.6 ms** | **4.93 ms** | **0.252 s** |
+
+### Sized from live data (`bintree 18`)
+
+tgc's worst case, kept for continuity with the tables above: one thread, no
+world to stop, and a quarter of the memory, so it collects 64 times against
+seven.
+
+| | collections | total pause | max pause | wall |
+|---|---|---|---|---|
+| conservative (300 MB pool) | 7 | 30.7 ms | 6.69 ms | 1.303 s |
+| tgc, before (74 MB) | 64 | 1060.2 ms | 27.69 ms | 1.945 s |
+| **tgc, after (74 MB)** | 64 | **551.1 ms** | **15.11 ms** | **1.425 s** |
+
+tgc is now 1.09x the default collector on the benchmark that suits it least,
+down from 1.48x.
+
+### With regions (`bintree_region 18 4`)
+
+| | collections | total pause | max pause | parallel section |
+|---|---|---|---|---|
+| no regions, before | 4985 | 929.3 ms | 16.43 ms | 0.447 s |
+| no regions, after | 4985 | 372.3 ms | 8.04 ms | 0.300 s |
+| regions, before | 5 | 28.6 ms | 17.01 ms | 0.268 s |
+| **regions, after** | 5 | **18.3 ms** | **8.15 ms** | **0.254 s** |
+
+Regions still take the collector nearly out of the request path; what changed is
+that the path they avoid is now much cheaper too, so the gap between "with" and
+"without" narrowed from 32x of total pause to 20x.
+
+### What is left
+
+Marking is now unambiguously the top cost -- `markPtr`, `lookup` and
+`drainMarkStack` together are about a third of runtime on binary-trees, against
+a sweep that has all but vanished from the profile. What remains there is the
+conservative scan itself and the cache misses inherent in chasing pointers
+through a heap, not the data structure around it. See `IMPROVEMENTS.md` for the
+four explanations already tested and rejected, now six.
