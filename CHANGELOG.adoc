@@ -193,6 +193,17 @@ Scaling is now linear rather than quadratic.
 
 === Added
 
+* `tgcMinHeap(size_t)` — a floor on a thread's collection threshold, the
+  analogue of the default collector's `minPoolSize`. Without it a thread
+  collects as soon as live data has grown by the growth factor, which for a
+  small live set means collecting constantly; `minPoolSize:300` is why the
+  default collector collects 7 times on binary-trees where tgc collected 64.
++
+It is *per thread*, because tgc's heaps are, so matching a global pool of N
+bytes across T threads means passing `N / T`. `bintree_mt.d` now does exactly
+that, giving both collectors the same 300 MB total budget: tgc goes from 4983
+collections to 27 at four workers, and from 2.171 s to 1.689 s.
+
 * *Fiber-scoped regions* — `tgcBeginRegion` / `tgcEndRegion` / `tgcRunInRegion`,
   with `tgcRegionVerify` and `tgcRegionBytes`. Everything allocated while a
   region is open comes from chunks it owns exclusively, and closing it releases

@@ -10,7 +10,9 @@ taken while that machine was swapping; these supersede them.
 
 ## Single-threaded (`bintree.d`)
 
-Best of 5.
+Best of 5. Here the default collector gets its 300 MB pool from
+`minPoolSize:300` and tgc sizes from live data — the mismatch is the point of
+the analysis below. `bintree_mt.d` matches the budgets instead.
 
 | depth | conservative | tgc | |
 |---|---|---|---|
@@ -55,23 +57,41 @@ avoid. The experiment was reverted — see `IMPROVEMENTS.md`.
 
 ## Multi-threaded (`bintree_mt.d`)
 
+Both collectors are given the same **300 MB total heap budget**, so the
+comparison is about the collectors rather than about how much memory each
+decided to use. `minPoolSize:300` configures the default collector;
+`tgcMinHeap(300 MB / workers)` is the equivalent for tgc, divided because tgc's
+heaps are per thread.
+
 Depth 18, parallel section only, best of 3.
 
 | workers | conservative | tgc | |
 |---|---|---|---|
-| 1 | 1.693 s | 3.139 s | tgc 0.5× |
-| 2 | 5.960 s | 2.087 s | **2.9×** |
-| 4 | 15.158 s | 1.324 s | **11.4×** |
-| 8 | 10.259 s | 3.148 s | 3.3× |
+| 1 | 1.820 s | 2.979 s | tgc 0.6× |
+| 2 | 5.265 s | 2.120 s | **2.5×** |
+| 4 | 11.524 s | **1.689 s** | **6.8×** |
 
-The default collector gets *worse* as threads are added — 1.7 s to 15.2 s from
-one worker to four — because every collection stops every thread. tgc improves
-with each worker up to 4.
+At four workers:
 
-Treat the 8-worker row with suspicion: the box has 8 cores with roughly one
-already busy, so eight workers oversubscribe it, and the conservative figure
-moving *down* from 4 to 8 workers is a sign the run is scheduling-bound rather
-than measuring the collector.
+| | collections | total pause | max pause |
+|---|---|---|---|
+| conservative | 8 | 418 ms | 88.5 ms |
+| tgc | 27 | 1847 ms | 86.2 ms |
+
+Giving tgc a comparable budget is worth a great deal: it collected **4983 times**
+when sized from live data and **27 times** with the budget, and its four-worker
+time improved from 2.171 s to 1.689 s. Max pause is now level with the default
+collector's rather than better, which is the expected trade — a larger heap
+means fewer but longer collections.
+
+The default collector still gets *worse* as threads are added, 1.8 s to 11.5 s
+between one and four workers, because every collection stops every thread. That
+is the effect tgc exists to remove, and matching the memory budget does not
+change it.
+
+Numbers above 4 workers are omitted deliberately: the box has 8 cores with
+roughly one already busy, so eight workers oversubscribe it and the results
+measure scheduling rather than the collector.
 
 ## With fiber regions (`bintree_region.d`)
 

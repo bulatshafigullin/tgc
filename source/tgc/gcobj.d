@@ -196,6 +196,29 @@ bool tgcRegionVerify() nothrow @nogc
     return tgc_getRegionVerify();
 }
 
+/**
+ * Floor on a thread's collection threshold — the analogue of the default
+ * collector's `minPoolSize`.
+ *
+ * A thread collects once its live data has grown by `tgcHeapGrowth`, which for
+ * a small live set means collecting very often. Raising the floor trades memory
+ * for far fewer collections, exactly as `--DRT-gcopt=minPoolSize` does for the
+ * default collector.
+ *
+ * This is **per thread**, because tgc's heaps are. To match a global pool of
+ * N bytes across T threads, pass N / T.
+ */
+void tgcMinHeap(size_t bytes) nothrow @nogc
+{
+    tgc_setMinHeap(bytes);
+}
+
+/// ditto
+size_t tgcMinHeap() nothrow @nogc
+{
+    return tgc_getMinHeap();
+}
+
 version (Tgc_default)
 {
     extern (C) __gshared string[] rt_options = [ "gcopt=gc:tgc" ];

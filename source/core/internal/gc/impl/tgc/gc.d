@@ -351,6 +351,31 @@ extern (C) bool tgc_getPreciseScanning() nothrow @nogc
     return atomicLoad(preciseScanning);
 }
 
+/**
+ * Floor on a thread's collection threshold — tgc's answer to `minPoolSize`.
+ *
+ * Without it a thread collects as soon as live data has grown by the growth
+ * factor, which for a small live set means collecting constantly. The default
+ * collector avoids that by starting with a large pool; `minPoolSize:300` is why
+ * it collects 7 times on binary-trees where tgc collects 64.
+ *
+ * Note this is *per thread*, because tgc's heaps are. A program wanting a total
+ * budget comparable to a global pool should divide by its thread count.
+ */
+private shared size_t minHeapSize = collectThresholdInit;
+
+/// ditto
+extern (C) void tgc_setMinHeap(size_t bytes) nothrow @nogc
+{
+    atomicStore(minHeapSize, bytes < collectThresholdInit ? collectThresholdInit : bytes);
+}
+
+/// ditto
+extern (C) size_t tgc_getMinHeap() nothrow @nogc
+{
+    return atomicLoad(minHeapSize);
+}
+
 private shared size_t heapGrowthFactor = 4;
 
 /**
@@ -376,8 +401,9 @@ private size_t thresholdFor(size_t live) nothrow @nogc
     immutable size_t headroom = wanted < capped ? wanted : capped;
 
     size_t t = live + headroom;
-    if (t < collectThresholdInit)
-        t = collectThresholdInit;
+    immutable size_t floor = atomicLoad(minHeapSize);
+    if (t < floor)
+        t = floor;
     return t;
 }
 
@@ -1051,7 +1077,7 @@ private struct ThreadHeap
         auto h = cast(ThreadHeap*) cstdlib.calloc(1, ThreadHeap.sizeof);
         if (!h)
             onOutOfMemoryError();
-        h.collectThreshold = collectThresholdInit;
+        h.collectThreshold = atomicLoad(minHeapSize);
         return h;
     }
 

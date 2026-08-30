@@ -17,12 +17,26 @@
  */
 import std;
 import std.datetime.stopwatch : StopWatch, AutoStart;
+import tgc.gcobj : tgcMinHeap;
 import core.thread;
 import core.atomic;
 import core.memory : GC;
 import core.stdc.stdio : fprintf, stderr;
 
 extern (C) __gshared string[] rt_options = ["gcopt=minPoolSize:300"];
+
+/**
+ * Total heap budget both collectors are given, so the comparison is about the
+ * collectors rather than about how much memory each decided to use.
+ *
+ * `minPoolSize:300` above hands the default collector a 300 MB pool. tgc
+ * ignores that option and sizes from live data, which is why it collected 64
+ * times on binary-trees where the default collector collected 7 -- a difference
+ * in policy, not in the collector. `tgcMinHeap` is the equivalent knob, and it
+ * is *per thread*, so the budget is divided by the worker count to give the
+ * same total.
+ */
+enum size_t totalHeapBudget = 300 * 1024 * 1024;
 
 enum MIN_DEPTH = 4;
 
@@ -106,6 +120,9 @@ void main(string[] args)
     if (workerCount > 64)
         workerCount = 64;
 
+    // Harmless under the default collector, which does not read it.
+    tgcMinHeap(totalHeapBudget / workerCount);
+
     auto maxDepth = max(MIN_DEPTH + 2, n);
     auto stretchDepth = maxDepth + 1;
 
@@ -147,7 +164,8 @@ void main(string[] args)
 
     immutable total = atomicLoad(grandTotal);
 
-    writeln(format("%d workers\t jobs: %d\t check sum: %d", workerCount, jobs.length, total));
+    writeln(format("%d workers\t jobs: %d\t heap budget: %d MB\t check sum: %d",
+        workerCount, jobs.length, totalHeapBudget / 1048576, total));
     writeln(format("long lived tree of depth %d\t check: %d", maxDepth, longLivedTree.check()));
     writeln(format("parallel section: %.3f s", sw.peek.total!"usecs" / 1_000_000.0));
 
