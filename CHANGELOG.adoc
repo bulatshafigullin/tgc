@@ -47,6 +47,12 @@ use those objects. See `CROSS-THREAD.md`.
 * `removeRoot`/`removeRange` no longer `assert(false)` — that halted the
   process in release builds when removing an unknown root.
 * `runFinalizers(segment)` is implemented instead of being a no-op.
+* *The retained-bytes total is no longer published with a plain store.*
+  `collectGlobal` re-derived `orphanBytes` from the orphan heap after resuming
+  the world, outside `orphanLock` and without an atomic, racing
+  `adoptOrphanChunks` on another thread. `sweepOrphanHeap` already publishes the
+  same value atomically under the lock, so the store is simply gone. Found by
+  ThreadSanitizer on Linux/x86-64.
 
 === Changed — performance
 

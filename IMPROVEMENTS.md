@@ -346,7 +346,17 @@ released the lock *immediately* rather than on scope exit, because D binds only
 the first statement to the guard. That one is exactly the class of bug the tool
 exists for.
 
-AddressSanitizer reports zero errors. Two reclamation assertions are skipped
+A later run, after the mark-and-sweep work, turned up one more real race that
+had been there all along: `collectGlobal` re-derived `orphanBytes` with a plain
+store to a `shared` variable, outside `orphanLock`, racing `adoptOrphanChunks`.
+Fixed by deleting it -- `sweepOrphanHeap` already publishes the value atomically
+under the lock. It reproduces intermittently, which is the usual shape and the
+reason a sanitizer run is worth repeating rather than doing once.
+
+AddressSanitizer reports zero errors *as CI runs it*, with
+`detect_leaks=0`. With leak detection on it reports one 1056-byte direct leak,
+which is a heap's root/range snapshot buffer never freed at shutdown -- item 9,
+known and deliberate rather than new. Worth fixing before the flag is turned on. Two reclamation assertions are skipped
 under `TgcSanitize`: ASan's redzones and quarantine change the stack layout
 enough that a conservative collector never lets the objects go. Reclamation is
 covered by the ordinary builds; the sanitizer run is checking safety.

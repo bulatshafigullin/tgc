@@ -1974,9 +1974,11 @@ private bool collectGlobal(ThreadGC gc) nothrow
     // World resumed. The orphan heap is owned by no thread, so it can be swept
     // now, with finalizers running normally. Its mark bits are untouched by
     // anyone else in the meantime.
+    // `sweepOrphanHeap` publishes the new retained total itself, atomically and
+    // under `orphanLock`. Re-deriving it here was both redundant and a plain
+    // store to a `shared` variable other threads read -- ThreadSanitizer caught
+    // it racing `adoptOrphanChunks`.
     sweepOrphanHeap();
-
-    orphanBytes = orphanHeap is null ? 0 : orphanHeap.reservedBytes;
     return true;
 }
 
