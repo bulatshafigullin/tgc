@@ -36,7 +36,9 @@ extern(C) __gshared rt_options = ["gcopt=gc:tgc"];
 == Design
 
 Each thread allocates from private 64 KiB chunk-aligned arenas carved into
-size-class slots. Because chunks are aligned to their own size, a candidate
+size-class slots, themselves carved from a few large huge-page-aligned mappings
+rather than from `malloc` -- on Linux that is worth an order of magnitude in
+pause time, because a per-chunk heap can never be backed by huge pages. Because chunks are aligned to their own size, a candidate
 pointer is resolved to its block by masking and indexing rather than by
 searching, so marking, `GC.free` and `GC.sizeOf` are all constant time. The
 mark phase uses an explicit worklist, visiting each live block exactly once.

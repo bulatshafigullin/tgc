@@ -288,11 +288,72 @@ Where the time goes now, binary-trees depth 18 (`perf`, self time):
 Marking grew as a *share* because everything around it got cheaper; in absolute
 terms it is unchanged, which is the point of the next section.
 
+## Segment-backed chunks — Linux/x86-64
+
+Same box and the same interleaved method, best of 5. "before" here is the state
+after the mark-and-sweep pass above, so this section measures the allocator
+change alone.
+
+The pass above left tgc at about 2.8x the default collector's cost per
+collection, all of it in the mark phase. Counting *why* is what found this: at a
+matched budget tgc executed the same instructions and missed cache 45% *less*,
+yet spent 27% more cycles, with 6.3x the dTLB misses. `smaps_rollup` gave the
+answer -- druntime maps its pool in one piece and the kernel backs 76 MB of it
+with huge pages, while tgc's per-chunk `posix_memalign` heap got **zero**.
+
+### At a matched 300 MB budget (`bintree_mt 18 1`)
+
+| | collections | total pause | max pause | parallel section |
+|---|---|---|---|---|
+| conservative | 7 | 124.1 ms | 30.05 ms | 1.824 s |
+| tgc, before | 7 | 374.4 ms | 70.81 ms | 2.279 s |
+| **tgc, after** | 7 | **38.4 ms** | **10.33 ms** | **1.548 s** |
+
+On the same live set and the same seven collections, tgc now spends **a third**
+of the default collector's pause rather than three times it, and a third of its
+worst pause. It is also faster in wall time on the single-threaded benchmark
+that has been its worst case throughout.
+
+Counters for that run:
+
+| | before | after | conservative |
+|---|---|---|---|
+| cycles | 7.42 G | 5.05 G | 6.54 G |
+| instructions | 20.18 G | 16.75 G | 19.80 G |
+| IPC | 2.72 | 3.32 | 3.03 |
+| page faults | 925,821 | **209,676** | 42,337 |
+| dTLB load misses | 6.67 M | **4.16 M** | 1.05 M |
+| `AnonHugePages` | 0 | ~154 MB | ~76 MB |
+| peak RSS | 606 MB | **541 MB** | 314 MB |
+
+Peak RSS falls rather than rises: the allocator reuses chunks instead of handing
+them to the kernel and faulting them back in.
+
+### Everything else
+
+| | wall | collections | total pause | max pause |
+|---|---|---|---|---|
+| bintree d18, conservative | 1.983 s | 7 | 134.7 ms | 39.32 ms |
+| bintree d18, tgc before | 4.516 s | 64 | 2500.4 ms | 64.44 ms |
+| bintree d18, tgc after | **3.256 s** | 64 | **2038.3 ms** | 56.93 ms |
+| mt d18 x4, conservative | 5.439 s | 8 | 778.4 ms | 153.58 ms |
+| mt d18 x4, tgc before | 2.320 s | 27 | 1127.7 ms | 91.07 ms |
+| mt d18 x4, tgc after | **0.649 s** | 27 | **124.7 ms** | **24.46 ms** |
+| region d18 x4, before | 2.120 s | 5 | 78.1 ms | 40.81 ms |
+| region d18 x4, after | **0.364 s** | 5 | 67.0 ms | 31.13 ms |
+
+The region benchmark gains most because it is the one that churns chunks
+hardest: every region close frees a whole set of them at once.
+
+macOS/arm64 is unchanged in either direction -- 1.42 s and 550 ms of pause on
+`bintree 18` before and after -- which is the expected answer where there are no
+transparent huge pages to get.
+
 ## What is left
 
-Marking is now unambiguously the top cost on both platforms -- `markPtr`,
-`lookup` and `drainMarkStack` together are 45% of runtime on x86-64, against a
-sweep that has dropped off the profile. What remains there is the conservative
-scan itself and the cache misses inherent in chasing pointers through a heap,
-not the data structure around it. See `IMPROVEMENTS.md` for the explanations
-already tested and rejected -- four before this pass, six now.
+Marking is still the top cost, and it is now most of what the collector does:
+the sweep is off the profile and the allocator is no longer faulting pages in a
+loop. What remains is the conservative scan itself and the cache misses
+inherent in chasing pointers through a heap. See `IMPROVEMENTS.md` for the
+explanations already tested and rejected -- four before these two passes, six
+now.

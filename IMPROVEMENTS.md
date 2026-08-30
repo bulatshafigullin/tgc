@@ -20,7 +20,8 @@ accounting, atomics on cross-thread state, unattached-thread collection refusal,
 Performance: chunk-arena allocator with O(1) pointer resolution, explicit mark
 worklist, array API implementation, threshold decay, chunk release, root
 snapshotting, pause-time instrumentation, **word-at-a-time sweeping**,
-**address-indexed chunk directory**, size-class table, pointer-map memo.
+**address-indexed chunk directory**, **segment-backed chunks (huge pages)**,
+size-class table, pointer-map memo.
 
 Infrastructure: UTF-8 conversion, `.gitattributes`, CI (DMD/LDC ×
 Linux/macOS/Windows + sanitizers + encoding guard), adversarial test suite,
@@ -107,6 +108,38 @@ reachable and untested — is the worst of the three.
 
 ## Open — smaller items
 
+### -3. Chunks came from malloc, and that cost more than the mark phase
+
+Found by counting rather than profiling. After the sweep work, at a matched
+300 MB budget, tgc executed the same instructions as the default collector and
+missed cache 45% *less*, yet spent 27% more cycles. The counter that separated
+them was `dTLB-load-misses`: 6.67 M against 1.05 M. `smaps_rollup` said why --
+druntime maps its pool in one piece and the kernel backs 76 MB of it with huge
+pages, while tgc's per-chunk `posix_memalign` heap got **zero**. The same
+allocation pattern also had glibc handing chunks back to the kernel and taking
+them again as the heap breathed: 926,000 page faults per run.
+
+Chunks now come from 32 MB segments, huge-page aligned and `MADV_HUGEPAGE` on
+Linux. Page faults fell to 210,000, dTLB misses to 4.16 M, and **total pause
+from 374 ms to 38 ms** -- a third of the default collector's 155 ms on the same
+live set. Peak RSS fell too, 606 MB to 541 MB. Full numbers in `BENCHMARKS.md`.
+
+What this leaves open:
+
+* **Retention is coarser than it was.** A segment is only unmapped when every
+  chunk in it is free, so one live chunk pins 32 MB. `GC.minimize()` covers the
+  gap by handing back each 2 MB span that holds nothing, but nothing calls that
+  automatically. A server that never calls it holds its peak. Worth revisiting:
+  doing the span-level drop during a collection when a segment falls below some
+  occupancy, rather than only on demand.
+* **The segment lock is global.** Chunk-granularity operations are rare enough
+  that it has not shown up -- four workers improved 3.6x -- but a
+  many-core allocation-heavy workload would be the test, and per-thread segment
+  ownership is the fix if it does.
+* macOS gains nothing from this (no transparent huge pages) and loses nothing
+  either; it measured identical before and after. Windows gets contiguity but
+  not huge pages, which need `SeLockMemoryPrivilege`.
+
 ### -2. The sweep, not the mark, was the largest cost — and it is fixed
 
 The earlier reading of this — "marking is ~6x slower per collection than
@@ -138,9 +171,8 @@ Two things this leaves:
 * **On x86-64 tgc still costs about 2.8x the default collector per collection**
   on the same live set, down from about 6x. That is the remaining gap, and it is
   now the mark phase almost entirely -- see item 0.
-* The `perf` share attributed to kernel page management (now 8.2%) and the
-  free-chunk cache that failed to fix it are unaffected by any of this, and
-  remain explained as first-touch faulting of a growing heap.
+* The `perf` share attributed to kernel page management is a *separate* problem
+  and turned out to be the larger one. See item -3.
 
 ### -2b. Experiments that did not pay, this pass
 
@@ -196,7 +228,9 @@ What *did* pay was replacing the hash map with an address-indexed directory
 with no memory touched, and adjacent chunks land on adjacent entries.
 
 What is left is the conservative scan itself and the cache misses inherent in
-chasing pointers through a large heap. The next real levers are structural:
+chasing pointers through a large heap. Note the counters say tgc already misses
+cache *less* than druntime's collector on the same live set, so the remaining
+levers are about work done, not about layout:
 interleaving the per-chunk `allocBits`/`markBits`/`sharedBits` so marking touches
 one line instead of two, moving `NO_SCAN` out of the byte-per-slot attribute
 array into a bitvector, and prefetching down the mark stack. All three are worth

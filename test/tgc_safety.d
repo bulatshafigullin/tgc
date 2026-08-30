@@ -835,3 +835,51 @@ unittest
     assert(after <= before + n * 64,
         "the bulk sweep did not return slots to the allocator");
 }
+
+unittest
+{
+    // Segments are mapped, carved into chunks, and handed back to the OS when
+    // they hold nothing. The middle of that is exercised by every other test
+    // here; this one checks the ends.
+    //
+    // The allocation has to be bigger than a whole segment, or it is simply
+    // carved out of one already mapped and nothing new appears -- so the
+    // segment size is turned down for the duration rather than allocating
+    // hundreds of megabytes to be sure.
+    import tgc.gcobj : tgcCommittedBytes, tgcSegmentSize;
+
+    immutable saved = tgcSegmentSize();
+    tgcSegmentSize(2 * 1024 * 1024);
+    scope (exit)
+        tgcSegmentSize(saved);
+
+    immutable before = tgcCommittedBytes();
+
+    {
+        auto big = new ubyte[4 * 1024 * 1024];
+        big[0] = 1;
+        big[$ - 1] = 2;
+        keepAlive(big.ptr);
+    }
+
+    immutable peak = tgcCommittedBytes();
+    assert(peak > before, "an allocation larger than a segment mapped nothing");
+
+    scrubStack();
+    version (TgcSanitize) enum tries = 40;
+    else enum tries = 5;
+    foreach (_; 0 .. tries)
+    {
+        scrubStack();
+        GC.collect();
+    }
+    GC.minimize();
+
+    // Sanitizer builds keep freed memory referenced from quarantine and shift
+    // the stack layout, so a conservative collector holds on to far more; what
+    // that run checks is safety, not reclamation.
+    version (TgcSanitize) {}
+    else
+        assert(tgcCommittedBytes() < peak,
+            "the memory an oversized allocation mapped was never given back");
+}

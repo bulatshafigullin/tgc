@@ -506,44 +506,553 @@ private size_t alignUp(size_t n, size_t a) nothrow @nogc
 }
 
 // ---------------------------------------------------------------------------
-// aligned chunk allocation
+// segment-backed chunk allocation
 // ---------------------------------------------------------------------------
+
+/*
+ * Chunks come from a few large mappings rather than one allocator call each.
+ *
+ * The reason is address translation, and it was measured rather than guessed.
+ * On binary-trees at a matched 300 MB budget, tgc executed the *same* number of
+ * instructions as druntime's collector and missed cache 45% less often, yet
+ * spent 27% more cycles. The counter that explained it was dTLB-load-misses:
+ * 8.08 M against 1.27 M, a 6.3x gap. `/proc/pid/smaps_rollup` said why --
+ * druntime maps its pool in one piece and the kernel backs 76 MB of it with
+ * 2 MB pages, while tgc's `posix_memalign(64 KiB)` chunks came back from malloc
+ * scattered across its arenas and got *zero* huge pages.
+ *
+ * So chunks are now carved out of segments: one mapping of several megabytes,
+ * aligned to the huge-page size and, on Linux, marked `MADV_HUGEPAGE`. Chunks
+ * stay 64 KiB-aligned inside it, so everything above this layer -- the chunk
+ * directory, the run-head encoding, `markPtr` -- is unchanged.
+ *
+ * Memory returns to the OS a segment at a time instead of a chunk at a time.
+ * That is the trade this makes, and it is the same delayed-return property that
+ * sank the free-chunk cache experiment; the difference is what it buys. One
+ * empty segment is kept back so a heap oscillating around a segment boundary
+ * does not unmap and remap on every collection.
+ */
+
+/// Huge-page granularity: segments are aligned and sized to it.
+private enum size_t hugePageSize = 2 * 1024 * 1024;
+
+static assert(hugePageSize % chunkSize == 0);
+
+private enum size_t defaultSegmentSize = 32 * 1024 * 1024;
+
+private shared size_t segmentSizeBytes = defaultSegmentSize;
+
+/// Size of the mappings chunks are carved from; rounded up to a huge page.
+extern (C) void tgc_setSegmentSize(size_t bytes) nothrow @nogc
+{
+    immutable size_t rounded = alignUp(bytes < hugePageSize ? hugePageSize : bytes, hugePageSize);
+    atomicStore(segmentSizeBytes, rounded);
+}
+
+/// ditto
+extern (C) size_t tgc_getSegmentSize() nothrow @nogc
+{
+    return atomicLoad(segmentSizeBytes);
+}
+
+/**
+ * Bytes of chunk storage currently backed by memory, allocated or not.
+ *
+ * Falls when a segment is unmapped, and when `GC.minimize()` hands back the
+ * huge-page-aligned spans inside a segment that hold nothing.
+ */
+extern (C) size_t tgc_getCommittedBytes() nothrow @nogc
+{
+    return atomicLoad(committedBytes);
+}
+
+private struct Segment
+{
+    void* reserveBase;  /// what the OS is handed back; `base` may be inside it
+    size_t reserveSize;
+    void* base;         /// first chunk, aligned to `hugePageSize`
+    size_t units;       /// chunks the segment holds
+    size_t freeUnits;
+    size_t* inUse;      /// one bit per unit
+    size_t* dropped;    /// one bit per huge-page span handed back to the OS
+    size_t decommittedUnits;
+    size_t hint;        /// unit to resume the first-fit search from
+    bool dedicated;     /// holds a single oversized run; released when freed
+
+    void* unitAddr(size_t i) nothrow @nogc
+    {
+        return cast(void*)(cast(ubyte*) base + i * chunkSize);
+    }
+
+    bool contains(void* p) nothrow @nogc
+    {
+        return p >= base && p < cast(void*)(cast(ubyte*) base + units * chunkSize);
+    }
+}
+
+private __gshared Segment** segTable; /// sorted by `base`, for lookup on free
+private __gshared size_t segCount;
+private __gshared size_t segCap;
+private __gshared Segment* segMru;    /// last segment an allocation came from
+private __gshared size_t segEmpty;    /// segments holding nothing
+private __gshared SpinLock segLock;
+private shared size_t committedBytes;
+
+// -- platform mapping -------------------------------------------------------
 
 version (Posix)
 {
-    import core.sys.posix.stdlib : posix_memalign;
+    import core.sys.posix.sys.mman : mmap, munmap, MAP_ANON, MAP_FAILED,
+        MAP_PRIVATE, PROT_READ, PROT_WRITE;
 
-    private void* chunkAlloc(size_t bytes) nothrow @nogc
+    // `madvise` is not in core.sys.posix.sys.mman, and MADV_HUGEPAGE -- the
+    // whole point of this allocator -- is Linux-specific, so both are declared
+    // here rather than skipped.
+    extern (C) int madvise(void* addr, size_t length, int advice) nothrow @nogc;
+
+    version (linux)
     {
-        void* p;
-        if (posix_memalign(&p, chunkSize, bytes) != 0)
-            return null;
-        return p;
+        private enum int MADV_HUGEPAGE = 14;
+        private enum int MADV_DONTNEED = 4;
+    }
+    else version (Darwin)
+    {
+        private enum int MADV_FREE = 5;
+    }
+    else
+    {
+        private enum int MADV_DONTNEED = 4;
     }
 
-    private void chunkFree(void* p) nothrow @nogc
+    /**
+     * Map `size` bytes aligned to `align_`, trimming the slack back to the OS.
+     */
+    private bool mapAligned(size_t size, size_t align_, out void* reserveBase,
+                            out size_t reserveSize, out void* base) nothrow @nogc
     {
-        cstdlib.free(p);
+        immutable size_t over = size + align_;
+        auto raw = mmap(null, over, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (raw is MAP_FAILED)
+            return false;
+
+        auto start = cast(ubyte*) raw;
+        auto aligned = cast(ubyte*) alignUp(cast(size_t) start, align_);
+
+        // Hand back the slack on both sides: a segment that keeps it would
+        // leave unusable holes between segments and inflate the chunk
+        // directory's span for nothing.
+        immutable size_t head = aligned - start;
+        if (head)
+            munmap(raw, head);
+        immutable size_t tail = over - head - size;
+        if (tail)
+            munmap(aligned + size, tail);
+
+        reserveBase = aligned;
+        reserveSize = size;
+        base = aligned;
+
+        version (linux)
+            madvise(aligned, size, MADV_HUGEPAGE);
+
+        return true;
+    }
+
+    private void unmapSegment(void* reserveBase, size_t reserveSize) nothrow @nogc
+    {
+        munmap(reserveBase, reserveSize);
+    }
+
+    /**
+     * Hand the pages under `[p, p + size)` back to the OS, keeping the mapping.
+     *
+     * The memory reads as zero afterwards on Linux, and either as zero or as
+     * its old contents on Darwin (`MADV_FREE` is lazy). Both are fine: a chunk
+     * handed out again has its header and metadata rewritten, and payload is
+     * only zeroed on request.
+     */
+    private void decommit(void* p, size_t size) nothrow @nogc
+    {
+        version (linux)
+            madvise(p, size, MADV_DONTNEED);
+        else version (Darwin)
+            madvise(p, size, MADV_FREE);
+        else
+            madvise(p, size, MADV_DONTNEED);
+    }
+
+    private void recommit(void* p, size_t size) nothrow @nogc
+    {
+        // Nothing to do: the mapping never went away, so the next touch faults
+        // a fresh page in. Re-advising huge pages is worth it on Linux, where
+        // MADV_DONTNEED clears the flag for the range.
+        version (linux)
+            madvise(p, size, MADV_HUGEPAGE);
     }
 }
 else version (Windows)
 {
-    extern (C) void* _aligned_malloc(size_t size, size_t alignment) nothrow @nogc;
-    extern (C) void _aligned_free(void* p) nothrow @nogc;
+    import core.sys.windows.winbase : VirtualAlloc, VirtualFree;
+    import core.sys.windows.winnt : MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE,
+        MEM_RESERVE, PAGE_READWRITE;
 
-    private void* chunkAlloc(size_t bytes) nothrow @nogc
+    /**
+     * Reserve with slack and commit the aligned part.
+     *
+     * A reservation can only be released from its own base, so unlike the POSIX
+     * path the slack stays reserved -- address space, not memory. Windows has
+     * no transparent huge pages; large pages need `SeLockMemoryPrivilege`, so
+     * this side gets the contiguity but not the TLB win.
+     */
+    private bool mapAligned(size_t size, size_t align_, out void* reserveBase,
+                            out size_t reserveSize, out void* base) nothrow @nogc
     {
-        return _aligned_malloc(bytes, chunkSize);
+        immutable size_t over = size + align_;
+        auto raw = VirtualAlloc(null, over, MEM_RESERVE, PAGE_READWRITE);
+        if (raw is null)
+            return false;
+
+        auto aligned = cast(void*) alignUp(cast(size_t) raw, align_);
+        if (VirtualAlloc(aligned, size, MEM_COMMIT, PAGE_READWRITE) is null)
+        {
+            VirtualFree(raw, 0, MEM_RELEASE);
+            return false;
+        }
+
+        reserveBase = raw;
+        reserveSize = over;
+        base = aligned;
+        return true;
     }
 
-    private void chunkFree(void* p) nothrow @nogc
+    private void unmapSegment(void* reserveBase, size_t reserveSize) nothrow @nogc
     {
-        _aligned_free(p);
+        VirtualFree(reserveBase, 0, MEM_RELEASE);
+    }
+
+    private void decommit(void* p, size_t size) nothrow @nogc
+    {
+        VirtualFree(p, size, MEM_DECOMMIT);
+    }
+
+    private void recommit(void* p, size_t size) nothrow @nogc
+    {
+        // Unlike POSIX this is mandatory: a decommitted page faults on access.
+        VirtualAlloc(p, size, MEM_COMMIT, PAGE_READWRITE);
     }
 }
 else
 {
-    static assert(false, "tgc: no aligned allocator for this platform");
+    static assert(false, "tgc: no segment mapping for this platform");
+}
+
+// -- segment table ----------------------------------------------------------
+
+/// Index of the segment containing `p`, or `segCount`. Called under `segLock`.
+private size_t segIndexOf(void* p) nothrow @nogc
+{
+    size_t lo = 0, hi = segCount;
+    while (lo < hi)
+    {
+        immutable size_t mid = lo + (hi - lo) / 2;
+        if (segTable[mid].base > p)
+            hi = mid;
+        else
+            lo = mid + 1;
+    }
+    if (lo == 0)
+        return segCount;
+    return segTable[lo - 1].contains(p) ? lo - 1 : segCount;
+}
+
+private void segTableInsert(Segment* s) nothrow @nogc
+{
+    if (segCount == segCap)
+    {
+        size_t ncap = segCap ? segCap * 2 : 16;
+        auto np = cast(Segment**) cstdlib.realloc(segTable, ncap * (Segment*).sizeof);
+        if (!np)
+            onOutOfMemoryError();
+        segTable = np;
+        segCap = ncap;
+    }
+
+    size_t i = segCount;
+    while (i > 0 && segTable[i - 1].base > s.base)
+    {
+        segTable[i] = segTable[i - 1];
+        i--;
+    }
+    segTable[i] = s;
+    segCount++;
+}
+
+private void segTableRemove(size_t idx) nothrow @nogc
+{
+    foreach (i; idx .. segCount - 1)
+        segTable[i] = segTable[i + 1];
+    segCount--;
+}
+
+/// First run of `n` free units at or after `from`, or `size_t.max`.
+private size_t segScan(Segment* s, size_t from, size_t n) nothrow @nogc
+{
+    size_t i = from;
+    while (i + n <= s.units)
+    {
+        if (testBit(s.inUse, i))
+        {
+            i++;
+            continue;
+        }
+        size_t j = 1;
+        while (j < n && !testBit(s.inUse, i + j))
+            j++;
+        if (j == n)
+            return i;
+        i += j + 1; // the unit at i + j is taken; nothing before it can start a run
+    }
+    return size_t.max;
+}
+
+/**
+ * First run of `n` free units in `s`, or `size_t.max`.
+ *
+ * Resumes from a hint rather than rescanning from unit zero, which matters once
+ * a segment is mostly full: allocation is otherwise linear in the segment.
+ */
+private size_t segFindRun(Segment* s, size_t n) nothrow @nogc
+{
+    if (s.freeUnits < n)
+        return size_t.max;
+
+    immutable size_t at = segScan(s, s.hint, n);
+    if (at != size_t.max)
+        return at;
+    return s.hint == 0 ? size_t.max : segScan(s, 0, n);
+}
+
+private Segment* segCreate(size_t bytes, bool dedicated) nothrow @nogc
+{
+    immutable size_t size = alignUp(bytes, hugePageSize);
+
+    auto s = cast(Segment*) cstdlib.calloc(1, Segment.sizeof);
+    if (!s)
+        onOutOfMemoryError();
+
+    if (!mapAligned(size, hugePageSize, s.reserveBase, s.reserveSize, s.base))
+    {
+        cstdlib.free(s);
+        return null;
+    }
+
+    s.units = size / chunkSize;
+    s.freeUnits = s.units;
+    s.dedicated = dedicated;
+    s.inUse = cast(size_t*) cstdlib.calloc(bitWords(s.units), size_t.sizeof);
+    s.dropped = cast(size_t*) cstdlib.calloc(bitWords(s.units / unitsPerSpan + 1), size_t.sizeof);
+    if (!s.inUse || !s.dropped)
+    {
+        cstdlib.free(s.inUse);
+        cstdlib.free(s.dropped);
+        unmapSegment(s.reserveBase, s.reserveSize);
+        cstdlib.free(s);
+        onOutOfMemoryError();
+    }
+
+    segTableInsert(s);
+    segEmpty++;
+    atomicOp!"+="(committedBytes, size);
+    return s;
+}
+
+private void segDestroy(size_t idx) nothrow @nogc
+{
+    auto s = segTable[idx];
+    segTableRemove(idx);
+    if (segMru is s)
+        segMru = null;
+    segEmpty--;
+    atomicOp!"-="(committedBytes, (s.units - s.decommittedUnits) * chunkSize);
+    cstdlib.free(s.inUse);
+    cstdlib.free(s.dropped);
+    unmapSegment(s.reserveBase, s.reserveSize);
+    cstdlib.free(s);
+}
+
+/// Units in one huge-page span, the granularity memory is handed back at.
+private enum size_t unitsPerSpan = hugePageSize / chunkSize;
+
+private void* segTake(Segment* s, size_t at, size_t n) nothrow @nogc
+{
+    // Take back anything `segDropFree` handed to the OS under these units.
+    immutable size_t firstSpan = at / unitsPerSpan;
+    immutable size_t lastSpan = (at + n - 1) / unitsPerSpan;
+    foreach (span; firstSpan .. lastSpan + 1)
+    {
+        if (!testBit(s.dropped, span))
+            continue;
+        recommit(cast(void*)(cast(ubyte*) s.base + span * hugePageSize), hugePageSize);
+        clearBit(s.dropped, span);
+        s.decommittedUnits -= unitsPerSpan;
+        atomicOp!"+="(committedBytes, hugePageSize);
+    }
+
+    foreach (k; 0 .. n)
+        setBit(s.inUse, at + k);
+    if (s.freeUnits == s.units)
+        segEmpty--;
+    s.freeUnits -= n;
+    s.hint = at + n;
+    return s.unitAddr(at);
+}
+
+// -- the interface the heap uses --------------------------------------------
+
+private void* chunkAlloc(size_t bytes) nothrow @nogc
+{
+    assert(bytes % chunkSize == 0, "tgc: chunk requests are whole chunks");
+    immutable size_t n = bytes / chunkSize;
+
+    segLock.lock(); tsanAcquire(cast(const(void)*) &segLock);
+    scope (exit)
+    {
+        tsanRelease(cast(const(void)*) &segLock);
+        segLock.unlock();
+    }
+
+    // A run larger than a segment gets its own mapping, sized to it.
+    if (bytes > atomicLoad(segmentSizeBytes))
+    {
+        auto s = segCreate(bytes, true);
+        if (!s)
+            return null;
+        return segTake(s, 0, n);
+    }
+
+    if (segMru !is null)
+    {
+        immutable size_t at = segFindRun(segMru, n);
+        if (at != size_t.max)
+            return segTake(segMru, at, n);
+    }
+
+    foreach (i; 0 .. segCount)
+    {
+        auto s = segTable[i];
+        if (s.dedicated || s is segMru)
+            continue;
+        immutable size_t at = segFindRun(s, n);
+        if (at != size_t.max)
+        {
+            segMru = s;
+            return segTake(s, at, n);
+        }
+    }
+
+    auto s = segCreate(atomicLoad(segmentSizeBytes), false);
+    if (!s)
+        return null;
+    segMru = s;
+    return segTake(s, 0, n);
+}
+
+/**
+ * Unmap every segment holding nothing.
+ *
+ * The automatic path keeps empty segments back, because unmapping memory a
+ * growing heap is about to ask for again is how the page-fault cost this
+ * allocator removes comes straight back. `GC.minimize()` is the documented
+ * "give it back now" call, so that is where the retained set is dropped.
+ */
+/**
+ * Hand back every huge-page span of `s` that holds no allocated chunk.
+ *
+ * Whole spans only. Decommitting part of one would split the huge page backing
+ * it, which is the property this allocator exists to get, so a segment with a
+ * live chunk every 2 MB gives nothing back -- and that is the right answer, not
+ * a bug: the pages are still in use.
+ */
+private void segDropFree(Segment* s) nothrow @nogc
+{
+    for (size_t i = 0; i + unitsPerSpan <= s.units; i += unitsPerSpan)
+    {
+        immutable size_t span = i / unitsPerSpan;
+        if (testBit(s.dropped, span))
+            continue;
+
+        bool free = true;
+        foreach (k; 0 .. unitsPerSpan)
+            if (testBit(s.inUse, i + k))
+            {
+                free = false;
+                break;
+            }
+        if (!free)
+            continue;
+
+        decommit(cast(void*)(cast(ubyte*) s.base + span * hugePageSize), hugePageSize);
+        setBit(s.dropped, span);
+        s.decommittedUnits += unitsPerSpan;
+        atomicOp!"-="(committedBytes, hugePageSize);
+    }
+}
+
+private void segReleaseEmpty() nothrow @nogc
+{
+    segLock.lock(); tsanAcquire(cast(const(void)*) &segLock);
+    scope (exit)
+    {
+        tsanRelease(cast(const(void)*) &segLock);
+        segLock.unlock();
+    }
+
+    size_t i = segCount;
+    while (i > 0)
+    {
+        i--;
+        if (segTable[i].freeUnits == segTable[i].units)
+            segDestroy(i);
+        else
+            segDropFree(segTable[i]);
+    }
+}
+
+private void chunkFree(void* p, size_t bytes) nothrow @nogc
+{
+    immutable size_t n = bytes / chunkSize;
+
+    segLock.lock(); tsanAcquire(cast(const(void)*) &segLock);
+    scope (exit)
+    {
+        tsanRelease(cast(const(void)*) &segLock);
+        segLock.unlock();
+    }
+
+    immutable size_t idx = segIndexOf(p);
+    assert(idx < segCount, "tgc: freeing a chunk that came from no segment");
+    auto s = segTable[idx];
+
+    immutable size_t at = (cast(ubyte*) p - cast(ubyte*) s.base) / chunkSize;
+    foreach (k; 0 .. n)
+        clearBit(s.inUse, at + k);
+    s.freeUnits += n;
+    if (at < s.hint)
+        s.hint = at;
+
+    if (s.freeUnits != s.units)
+        return;
+
+    segEmpty++;
+    // Empty segments are kept back rather than unmapped on the spot. A heap
+    // that oscillates -- which is every heap, between collections -- would
+    // otherwise unmap memory and immediately fault it back in, and re-faulting
+    // is the cost this allocator exists to avoid: it took binary-trees from
+    // 926,000 page faults to 112,000. Waste is bounded to a quarter of what is
+    // mapped, plus one segment so that a small program still keeps one.
+    if (s.dedicated || segEmpty > 2 + segCount / 2)
+        segDestroy(idx);
 }
 
 // ---------------------------------------------------------------------------
@@ -1346,14 +1855,17 @@ private struct ThreadHeap
     {
         unlinkPartial(c);
         unlinkAll(c);
+        // Read the run length before the memory goes back: the header lives in
+        // the first chunk of the run.
+        immutable size_t bytes = c.runChunks * chunkSize;
         auto raw = cast(ubyte*) c;
         foreach (i; 0 .. c.runChunks)
             map.remove(cast(void*)(raw + i * chunkSize));
         if (c.region !is null)
-            c.region.reservedBytes -= c.runChunks * chunkSize;
+            c.region.reservedBytes -= bytes;
         else
-            reservedBytes -= c.runChunks * chunkSize;
-        chunkFree(raw);
+            reservedBytes -= bytes;
+        chunkFree(raw, bytes);
     }
 
     void linkAll(Chunk* c) nothrow @nogc
@@ -2165,10 +2677,11 @@ extern (C) void tgc_endRegion(void* handle) nothrow
             if (a & (BlkAttr.FINALIZE | BlkAttr.STRUCTFINAL))
                 finalizeBlock(c.slotAt(idx), c.capacity(), a, c.meta[idx].ti);
         }
+        immutable size_t bytes = c.runChunks * chunkSize;
         auto raw = cast(ubyte*) c;
         foreach (i; 0 .. c.runChunks)
             heap.map.remove(cast(void*)(raw + i * chunkSize));
-        chunkFree(raw);
+        chunkFree(raw, bytes);
         c = next;
     }
     heap.finalizing = false;
@@ -2211,6 +2724,7 @@ private pragma(crt_constructor) void gc_tgc_ctor()
 {
     heapsLock = SpinLock(SpinLock.Contention.brief);
     orphanLock = SpinLock(SpinLock.Contention.brief);
+    segLock = SpinLock(SpinLock.Contention.brief);
     _d_register_tgc_gc();
 }
 
@@ -2310,6 +2824,11 @@ class ThreadGC : GC
                 heap.releaseChunk(c);
             c = next;
         }
+
+        // ... and then every segment those chunks came from, if it is now
+        // empty. This is the only path that returns address space to the OS
+        // eagerly; the allocator otherwise keeps a bounded set back.
+        segReleaseEmpty();
     }
 
     uint getAttr(void* p) nothrow

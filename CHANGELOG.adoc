@@ -56,6 +56,41 @@ use those objects. See `CROSS-THREAD.md`.
 
 === Changed — performance
 
+* *Chunks come from large mappings instead of from `malloc`.* Each 64 KiB chunk
+  used to be its own `posix_memalign` call. Two things followed from that, and
+  both were measured rather than guessed. The heap could never be backed by huge
+  pages -- `smaps_rollup` reported *zero* `AnonHugePages` against the default
+  collector's 76 MB -- so tgc took 6.3x the dTLB misses on the same live set.
+  And glibc returned and re-took those chunks from the kernel as the heap
+  breathed, at 926,000 page faults per run.
++
+Chunks are now carved from segments: one mapping of 32 MB (tunable with
+`tgcSegmentSize`), aligned to the huge-page size and, on Linux, marked
+`MADV_HUGEPAGE`. Chunks stay 64 KiB-aligned inside it, so the chunk directory,
+the run-head encoding and `markPtr` are untouched.
++
+Measured on Linux/x86-64 at a matched 300 MB budget, seven collections either
+way: page faults 926,000 to 210,000, dTLB load misses 6.67 M to 4.16 M, cycles
+7.42 G to 5.05 G, and **total pause 374 ms to 38 ms** -- against the default
+collector's 155 ms on the same live set, which tgc now beats by 3.2x rather than
+losing to by 2.4x. Four workers: 1128 ms of pause to 125 ms, and the parallel
+section from 2.32 s to 0.65 s. The fiber-region benchmark, which frees whole
+chunk sets at every region close, went from 2.12 s to 0.36 s.
++
+Peak RSS fell with it, 606 MB to 541 MB, because the allocator reuses chunks
+instead of handing them back and faulting them in again. macOS is unaffected in
+either direction: it has no transparent huge pages, and the benchmark measures
+the same before and after.
++
+The trade is *when* memory goes back. Freed chunks stay in their segment, and
+empty segments are kept -- bounded to a quarter of what is mapped, plus one --
+rather than unmapped on the spot, because unmapping memory a growing heap is
+about to ask for again is exactly the fault this removes. `GC.minimize()`
+returns it: empty segments are unmapped, and inside a segment still in use every
+2 MB span holding nothing is handed back with `MADV_DONTNEED`. Whole spans only;
+decommitting part of one would split the huge page and give back the property
+this exists for.
+
 * *A chunk that holds no finalizable slot is swept a word at a time.*
   Reclaiming a slot used to cost a 16-byte `SlotMeta` store, an attribute-byte
   store and two bit updates, per dead object, on cold lines -- and a walk of the
