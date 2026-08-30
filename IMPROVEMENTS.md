@@ -210,10 +210,17 @@ against `conservative` on pause distribution, N-thread scaling and allocation
 throughput belongs in the repository, ideally tracked in CI so a regression in
 the mark phase is visible.
 
-### 8. Conservative-only marking
+### 8. Precise scanning is on, but is the newest and least-proven feature
 
-`TypeInfo` is now recorded per block but unused for scanning. Precise scanning
-of blocks with known pointer maps would cut both false retention and mark time.
+Marking now consults `TypeInfo.rtInfo` and skips words that cannot be pointers,
+which is worth 4-6%. It falls back to conservative for unknown types, for
+`rtinfoHasPointers`, and for appendable blocks whose `TypeInfo` is a class.
+
+It has only been exercised against LDC. druntime keeps its own precise mode
+opt-in (`gc:precise`), which suggests less than full confidence in `RTInfo`
+across compilers, and an under-scan here means freeing live memory rather than
+a visible failure. `tgcPreciseScanning(false)` turns it off; the DMD leg of CI
+is the first real cross-compiler check.
 
 Note that full concurrency in FUGC's sense is *not* reachable: it depends on a
 Dijkstra store barrier, and D has no write barrier without compiler support.

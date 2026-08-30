@@ -98,6 +98,24 @@ size_t tgcHeapGrowth() nothrow @nogc
     return tgc_getHeapGrowth();
 }
 
+/**
+ * Use `TypeInfo` pointer maps to skip words that cannot hold references.
+ *
+ * On by default. Scanning falls back to conservative whenever the layout is
+ * unknown or ambiguous, so this only ever scans less where the compiler has
+ * said that is safe. Turn it off to rule a suspected precision bug in or out.
+ */
+void tgcPreciseScanning(bool enable) nothrow @nogc
+{
+    tgc_setPreciseScanning(enable);
+}
+
+/// ditto
+bool tgcPreciseScanning() nothrow @nogc
+{
+    return tgc_getPreciseScanning();
+}
+
 version (Tgc_default)
 {
     extern (C) __gshared string[] rt_options = [ "gcopt=gc:tgc" ];

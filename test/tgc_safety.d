@@ -662,3 +662,120 @@ unittest
     assert(finalizerAllocation[0] == 0xC3 && finalizerAllocation[$ - 1] == 0x3C,
         "memory allocated from a finalizer did not survive a later collection");
 }
+
+// ---------------------------------------------------------------------------
+// precise scanning must not lose heap-to-heap references
+// ---------------------------------------------------------------------------
+
+__gshared int preciseTailDead;
+
+/// Reference fields deliberately surrounded by scalars at awkward offsets, so
+/// a wrong pointer map shows up as a missed reference rather than by luck.
+class Layout
+{
+    ulong a;
+    Layout next;        // reference between scalars
+    double b;
+    string s;           // another indirection
+    ubyte[24] pad;
+    void* raw;
+}
+
+class PreciseTail { ~this() { preciseTailDead = 1; } ubyte[64] pad; }
+
+__gshared int arrayElemDead;
+/// A distinct canary: sharing one flag across tests lets an earlier test's
+/// garbage, collected later, fail a subsequent assertion.
+class ArrayElem { ~this() { arrayElemDead = 1; } ubyte[64] pad; }
+
+struct MixedStruct
+{
+    int x;
+    Object o;           // reference at word 1 of 4
+    long y;
+    double z;
+}
+
+private Layout buildChain(int depth)
+{
+    Layout head;
+    foreach (i; 0 .. depth)
+    {
+        auto n = new Layout;
+        n.a = i;
+        n.b = i * 1.5;
+        n.s = "chain link";
+        n.next = head;
+        head = n;
+    }
+    return head;
+}
+
+unittest
+{
+    // A chain reachable only through heap objects. If the pointer map is wrong,
+    // the collector loses the tail and frees live links.
+    assert(tgcPreciseScanning(), "precise scanning should default to on");
+
+    enum depth = 500 / workScale;
+    auto chain = buildChain(depth);
+    scrubStack();
+
+    foreach (_; 0 .. 3)
+        GC.collect();
+
+    // Walk the whole chain: every link must still be intact.
+    int seen = 0;
+    for (auto n = chain; n !is null; n = n.next)
+    {
+        assert(n.a == depth - 1 - seen, "chain link corrupted or lost");
+        assert(n.s == "chain link", "indirection through a precisely scanned block was lost");
+        seen++;
+    }
+    assert(seen == depth, "precise scanning lost part of a heap-to-heap chain");
+    keepAlive(cast(void*) chain);
+}
+
+unittest
+{
+    // The tail of a chain, held only by a precisely scanned struct on the heap.
+    preciseTailDead = 0;
+
+    auto holder = new MixedStruct;
+    holder.x = 7;
+    holder.o = new PreciseTail;
+    holder.y = 99;
+    holder.z = 1.25;
+
+    scrubStack();
+    foreach (_; 0 .. 3)
+        GC.collect();
+
+    assert(!preciseTailDead,
+        "an object referenced only from a precisely scanned struct was collected");
+    assert(holder.x == 7 && holder.y == 99);
+    keepAlive(cast(void*) holder);
+}
+
+unittest
+{
+    // An array of class references carries the element class's TypeInfo, whose
+    // map describes an instance rather than a reference. Using it would skip
+    // every element; the layout resolver must stay conservative here.
+    enum n = 200 / workScale;
+    auto arr = new ArrayElem[n];
+    foreach (i; 0 .. n)
+        arr[i] = new ArrayElem;
+
+    arrayElemDead = 0;
+    scrubStack();
+    foreach (_; 0 .. 3)
+        GC.collect();
+
+    assert(!arrayElemDead,
+        "elements of an array of class references were collected; the pointer " ~
+        "map for the element class was wrongly applied to the reference array");
+    foreach (i; 0 .. n)
+        assert(arr[i] !is null);
+    keepAlive(arr.ptr);
+}

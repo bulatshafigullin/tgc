@@ -148,6 +148,43 @@ private StackContext* currentStackContext(ThreadBase t) nothrow @nogc
 }
 
 /**
+ * Resolve a block's pointer layout from its `TypeInfo`.
+ *
+ * Returns false when the type says the block holds no references at all, so it
+ * need not be scanned. Otherwise `bitmap`/`elemWords` describe which words may
+ * be pointers, or are left null/zero to mean "scan every word".
+ *
+ * Deliberately conservative in three places. An unknown type scans everything.
+ * `rtinfoHasPointers` -- what the compiler emits when it cannot describe a
+ * layout -- scans everything. And an *appendable* block whose TypeInfo is a
+ * class scans everything, because that is an array of references while the
+ * class's own bitmap describes an instance; using it would skip real pointers.
+ */
+private bool layoutOf(TypeInfo ti, uint attr, out const(size_t)* bitmap,
+                      out size_t elemWords) nothrow
+{
+    if (ti is null || !atomicLoad(preciseScanning))
+        return true; // conservative
+
+    if ((attr & BlkAttr.APPENDABLE) && (cast(TypeInfo_Class) ti) !is null)
+        return true; // array of class references
+
+    auto ri = cast(const(size_t)*) ti.rtInfo();
+    if (ri is null)
+        return false; // rtinfoNoPointers
+    if (ri is cast(const(size_t)*) 1)
+        return true; // rtinfoHasPointers
+
+    immutable size_t elem = ri[0];
+    if (elem < (void*).sizeof)
+        return true;
+
+    bitmap = ri + 1;
+    elemWords = elem / (void*).sizeof;
+    return true;
+}
+
+/**
  * Marks the conservative scanning routines as exempt from AddressSanitizer.
  *
  * A conservative collector deliberately reads memory a sanitizer considers
@@ -254,6 +291,28 @@ private enum size_t collectThresholdInit = 256 * 1024;
  * conservative collector collected 7, spending 1.76 s of a 2.81 s run in the
  * collector.
  */
+/**
+ * Use `TypeInfo.rtInfo` pointer maps to skip words that cannot hold references.
+ *
+ * Falls back to conservative scanning whenever the layout is unknown or
+ * ambiguous, so this only ever scans *less* where the compiler has said it is
+ * safe to. Switchable mainly so a suspected precision bug can be ruled in or
+ * out without rebuilding.
+ */
+private shared bool preciseScanning = true;
+
+/// ditto
+extern (C) void tgc_setPreciseScanning(bool enable) nothrow @nogc
+{
+    atomicStore(preciseScanning, enable);
+}
+
+/// ditto
+extern (C) bool tgc_getPreciseScanning() nothrow @nogc
+{
+    return atomicLoad(preciseScanning);
+}
+
 private shared size_t heapGrowthFactor = 4;
 
 /**
@@ -848,6 +907,10 @@ private struct MarkItem
 {
     void* base;
     size_t size;
+    /// Pointer bitmap from TypeInfo.rtInfo, or null to scan conservatively.
+    const(size_t)* bitmap;
+    /// Words per bitmap repeat. Zero means conservative.
+    size_t elemWords;
 }
 
 private struct RangeSnap
@@ -1226,7 +1289,8 @@ private struct ThreadHeap
 
     // -- mark worklist ------------------------------------------------------
 
-    void pushMark(void* base, size_t size) nothrow @nogc
+    void pushMark(void* base, size_t size, const(size_t)* bitmap = null,
+                  size_t elemWords = 0) nothrow @nogc
     {
         if (markLen == markCap)
         {
@@ -1237,7 +1301,7 @@ private struct ThreadHeap
             markStack = np;
             markCap = ncap;
         }
-        markStack[markLen++] = MarkItem(base, size);
+        markStack[markLen++] = MarkItem(base, size, bitmap, elemWords);
     }
 }
 
@@ -2357,7 +2421,38 @@ private:
         while (heap.markLen)
         {
             auto item = heap.markStack[--heap.markLen];
-            markRange(heap, item.base, cast(void*)(cast(ubyte*) item.base + item.size));
+            if (item.elemWords)
+                markRangePrecise(heap, item.base, item.size, item.bitmap, item.elemWords);
+            else
+                markRange(heap, item.base, cast(void*)(cast(ubyte*) item.base + item.size));
+        }
+    }
+
+    /**
+     * Scan a block consulting its pointer map, probing only the words the
+     * compiler says can hold a reference.
+     *
+     * The map repeats every `elemWords`, which is what an array of the type
+     * needs; for a single object the repeat simply covers the size-class slack
+     * past the object, where nothing live can be stored anyway.
+     */
+    @conservativeScan
+    void markRangePrecise(ThreadHeap* heap, void* base, size_t size,
+                          const(size_t)* bitmap, size_t elemWords) nothrow
+    {
+        auto p = cast(void**) base;
+        immutable size_t words = size / (void*).sizeof;
+        size_t i = 0;
+        while (i < words)
+        {
+            immutable size_t limit = i + elemWords <= words ? elemWords : words - i;
+            foreach (k; 0 .. limit)
+            {
+                immutable size_t w = bitmap[k / bitsPerWord];
+                if (w & (cast(size_t) 1 << (k % bitsPerWord)))
+                    markPtr(heap, p[i + k]);
+            }
+            i += elemWords;
         }
     }
 
@@ -2594,7 +2689,15 @@ private:
         // marked during that pass is reachable from a global and gets promoted.
         if (heap.markAsShared)
             c.setShared(b.idx);
-        if (!(c.attrOf(b.idx) & BlkAttr.NO_SCAN))
-            heap.pushMark(b.payload(), b.capacity());
+
+        immutable uint attr = c.attrOf(b.idx);
+        if (attr & BlkAttr.NO_SCAN)
+            return;
+
+        const(size_t)* bitmap;
+        size_t elemWords;
+        if (!layoutOf(c.meta[b.idx].ti, attr, bitmap, elemWords))
+            return; // the type says there is nothing to find in here
+        heap.pushMark(b.payload(), b.capacity(), bitmap, elemWords);
     }
 }

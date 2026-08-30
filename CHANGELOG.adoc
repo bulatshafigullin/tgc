@@ -50,6 +50,23 @@ use those objects. See `CROSS-THREAD.md`.
 
 === Changed — performance
 
+* *Precise scanning via `TypeInfo.rtInfo` pointer maps* (`tgcPreciseScanning`,
+  on by default). Marking consults the compiler-emitted map for a block and
+  probes only the words that can hold a reference: for a class with two
+  reference fields among a vtable pointer and a monitor, half the words; for a
+  class of mixed scalars and references, closer to a fifth.
++
+Conservative in three places, deliberately. An unknown type scans everything;
+`rtinfoHasPointers` -- what the compiler emits when it cannot describe a layout
+-- scans everything; and an *appendable* block whose `TypeInfo` is a class
+scans everything, because that is an array of references while the class's map
+describes an instance. That last case is not hypothetical: `new C[8]` passes
+the element class's `TypeInfo`, whose map for a pointer-free class reads "no
+pointers" while the block is eight live references.
++
+Binary-trees depth 18 went from 2.03 s to 1.95 s, depth 20 from 9.32 s to
+8.79 s, and a 256k-object collection from 1.80 ms to 1.69 ms.
+
 * *Allocation uses the bitmap instead of an intrusive free list*, and no longer
   zeroes every block. Profiling binary-trees put `freeSlot` at the top of the
   self-time histogram, ahead of marking: the free list was threaded through the
