@@ -46,6 +46,17 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         compiler: [dmd-latest, ldc-latest]
+        exclude:
+          # GitHub's macos-latest runners are arm64 and DMD ships no arm64
+          # macOS build, so setup-dlang fails before anything is compiled:
+          # "the dmd compiler is not supported for non-x64 architecture".
+          # Covered by the x64 image below instead, so the DMD/macOS
+          # combination stays tested rather than quietly dropped.
+          - os: macos-latest
+            compiler: dmd-latest
+        include:
+          - os: macos-13
+            compiler: dmd-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dlang-community/setup-dlang@v1
