@@ -557,6 +557,7 @@ private struct Chunk
 
     size_t runChunks; /// chunks spanned (large runs only; 1 for small chunks)
     size_t largeSize; /// payload capacity of the single slot in a large run
+    Region* region;   /// owning region, or null when owned by the thread heap
 
     bool inPartial;
 
@@ -900,6 +901,43 @@ private struct ChunkMap
 }
 
 // ---------------------------------------------------------------------------
+// regions
+// ---------------------------------------------------------------------------
+
+/**
+ * A request-scoped arena bound to one fiber.
+ *
+ * Everything allocated while the region is current comes from chunks the region
+ * owns exclusively, and at `end` the whole set is released without tracing.
+ * This is the BEAM model -- a process dies and its heap goes with it -- and it
+ * carries BEAM's precondition: nothing outside may still point in. BEAM enforces
+ * that by deep-copying every message; D cannot, so it is the caller's
+ * invariant, checkable with `tgcRegionVerify`.
+ *
+ * Region chunks are never swept by a thread-local collection: everything in a
+ * region stays live until the region ends, which is the whole point. They are
+ * still *marked through*, because a region object may be the only thing keeping
+ * a thread-heap object alive.
+ */
+private struct Region
+{
+    ThreadHeap* owner;
+    StackContext* ctx;      /// the fiber this region is bound to
+    Region* next;           /// in the owner's region list
+
+    Chunk* chunks;
+    Chunk*[numClasses] partial;
+    size_t usedBytes;
+    size_t reservedBytes;
+}
+
+/// Non-zero while any region exists, so the allocation fast path can skip the
+/// per-allocation context lookup entirely when regions are not in use.
+private shared int activeRegions;
+
+private shared bool regionVerify;
+
+// ---------------------------------------------------------------------------
 // mark worklist
 // ---------------------------------------------------------------------------
 
@@ -928,6 +966,17 @@ private struct ThreadHeap
     ChunkMap map;
     Chunk* allChunks;
     Chunk*[numClasses] partial;
+
+    /// Regions currently open on this thread, and a one-entry cache so the
+    /// allocation path resolves the running fiber's region with a pointer
+    /// compare rather than a list walk.
+    Region* regions;
+    StackContext* cachedCtx;
+    Region* cachedRegion;
+
+    /// Set while verifying a region: markPtr records the first inbound hit.
+    Region* verifyRegion;
+    void* verifyHit;
 
     size_t usedBytes;      /// bytes in allocated slots
     size_t reservedBytes;  /// bytes held in chunks, allocated or not
@@ -985,7 +1034,7 @@ private struct ThreadHeap
 
     // -- chunk lifecycle ----------------------------------------------------
 
-    Chunk* newSmallChunk(uint cls) nothrow @nogc
+    Chunk* newSmallChunk(uint cls, Region* region) nothrow @nogc
     {
         immutable uint slotSize = sizeClasses[cls];
 
@@ -1035,19 +1084,25 @@ private struct ThreadHeap
         c.nextFree = 0;
         c.cls = cls;
         c.runChunks = units;
+        c.region = region;
 
         // One wipe covers the bitvectors, the attribute bytes and the metadata.
         memset(cast(ubyte*) raw + bitsOff, 0, dataOff - bitsOff);
 
+        // Registered in the thread's map either way, so a pointer into a
+        // region block still resolves through the ordinary lookup path.
         foreach (i; 0 .. units)
             map.put(cast(void*)(cast(ubyte*) raw + i * chunkSize), c);
         linkAll(c);
         linkPartial(c);
-        reservedBytes += bytes;
+        if (region !is null)
+            region.reservedBytes += bytes;
+        else
+            reservedBytes += bytes;
         return c;
     }
 
-    Chunk* newLargeChunk(size_t size) nothrow @nogc
+    Chunk* newLargeChunk(size_t size, Region* region) nothrow @nogc
     {
         // A large chunk holds exactly one slot, so one word of each bitvector
         // and one attribute byte suffice.
@@ -1081,6 +1136,7 @@ private struct ThreadHeap
         c.freeCount = 0;
         c.cls = uint.max;
         c.runChunks = runChunks;
+        c.region = region;
         // The request, not the whole rounded-up run. Reporting the run made a
         // 9000-byte allocation look like 65408 bytes, and every collection
         // scanned -- and every allocation zeroed -- all of it.
@@ -1092,7 +1148,10 @@ private struct ThreadHeap
             map.put(cast(void*)(cast(ubyte*) raw + i * chunkSize), c);
 
         linkAll(c);
-        reservedBytes += runChunks * chunkSize;
+        if (region !is null)
+            region.reservedBytes += runChunks * chunkSize;
+        else
+            reservedBytes += runChunks * chunkSize;
         return c;
     }
 
@@ -1103,25 +1162,30 @@ private struct ThreadHeap
         auto raw = cast(ubyte*) c;
         foreach (i; 0 .. c.runChunks)
             map.remove(cast(void*)(raw + i * chunkSize));
-        reservedBytes -= c.runChunks * chunkSize;
+        if (c.region !is null)
+            c.region.reservedBytes -= c.runChunks * chunkSize;
+        else
+            reservedBytes -= c.runChunks * chunkSize;
         chunkFree(raw);
     }
 
     void linkAll(Chunk* c) nothrow @nogc
     {
+        auto head = c.region !is null ? &c.region.chunks : &allChunks;
         c.prevAll = null;
-        c.nextAll = allChunks;
-        if (allChunks)
-            allChunks.prevAll = c;
-        allChunks = c;
+        c.nextAll = *head;
+        if (*head)
+            (*head).prevAll = c;
+        *head = c;
     }
 
     void unlinkAll(Chunk* c) nothrow @nogc
     {
+        auto head = c.region !is null ? &c.region.chunks : &allChunks;
         if (c.prevAll)
             c.prevAll.nextAll = c.nextAll;
         else
-            allChunks = c.nextAll;
+            *head = c.nextAll;
         if (c.nextAll)
             c.nextAll.prevAll = c.prevAll;
         c.nextAll = c.prevAll = null;
@@ -1131,11 +1195,12 @@ private struct ThreadHeap
     {
         if (c.inPartial || c.isLarge())
             return;
+        auto head = c.region !is null ? &c.region.partial[c.cls] : &partial[c.cls];
         c.prevPartial = null;
-        c.nextPartial = partial[c.cls];
-        if (partial[c.cls])
-            partial[c.cls].prevPartial = c;
-        partial[c.cls] = c;
+        c.nextPartial = *head;
+        if (*head)
+            (*head).prevPartial = c;
+        *head = c;
         c.inPartial = true;
     }
 
@@ -1143,10 +1208,11 @@ private struct ThreadHeap
     {
         if (!c.inPartial)
             return;
+        auto head = c.region !is null ? &c.region.partial[c.cls] : &partial[c.cls];
         if (c.prevPartial)
             c.prevPartial.nextPartial = c.nextPartial;
         else
-            partial[c.cls] = c.nextPartial;
+            *head = c.nextPartial;
         if (c.nextPartial)
             c.nextPartial.prevPartial = c.prevPartial;
         c.nextPartial = c.prevPartial = null;
@@ -1219,7 +1285,7 @@ private struct ThreadHeap
 
     // -- allocation ---------------------------------------------------------
 
-    BlkRef allocSlot(size_t size) nothrow @nogc
+    BlkRef allocSlot(size_t size, Region* region) nothrow @nogc
     {
         // Allocate black while a collection is in flight. A finalizer running
         // during the sweep may allocate, and it can be handed a slot from the
@@ -1230,18 +1296,21 @@ private struct ThreadHeap
 
         if (size > maxSmall)
         {
-            auto c = newLargeChunk(size);
+            auto c = newLargeChunk(size, region);
             c.setAllocated(0);
             if (birthMarked)
                 c.setMarked(0);
-            usedBytes += c.largeSize;
+            if (region !is null)
+                region.usedBytes += c.largeSize;
+            else
+                usedBytes += c.largeSize;
             return BlkRef(c, 0);
         }
 
         immutable uint cls = classOf(size ? size : 1);
-        auto c = partial[cls];
+        auto c = region !is null ? region.partial[cls] : partial[cls];
         if (!c)
-            c = newSmallChunk(cls);
+            c = newSmallChunk(cls, region);
 
         size_t idx = c.firstFree(c.nextFree);
         assert(idx < c.slotCount, "tgc: partial chunk has no free slot");
@@ -1253,7 +1322,10 @@ private struct ThreadHeap
         c.setAllocated(idx);
         if (birthMarked)
             c.setMarked(idx);
-        usedBytes += c.slotSize;
+        if (region !is null)
+            region.usedBytes += c.slotSize;
+        else
+            usedBytes += c.slotSize;
         return BlkRef(c, idx);
     }
 
@@ -1267,7 +1339,10 @@ private struct ThreadHeap
 
         if (c.isLarge())
         {
-            usedBytes -= c.largeSize;
+            if (c.region !is null)
+                c.region.usedBytes -= c.largeSize;
+            else
+                usedBytes -= c.largeSize;
             releaseChunk(c);
             return;
         }
@@ -1275,7 +1350,10 @@ private struct ThreadHeap
         if (b.idx < c.nextFree)
             c.nextFree = cast(uint) b.idx;
         c.freeCount++;
-        usedBytes -= c.slotSize;
+        if (c.region !is null)
+            c.region.usedBytes -= c.slotSize;
+        else
+            usedBytes -= c.slotSize;
         linkPartial(c);
     }
 
@@ -1680,6 +1758,167 @@ private void sweepOrphanHeap() nothrow
     atomicStore(orphanBytes, h.reservedBytes);
 }
 
+/**
+ * Open a region bound to the running fiber.
+ *
+ * Returns null if this fiber already has one; regions do not nest, because a
+ * nested region's blocks would be freed while the outer one still ran.
+ */
+/**
+ * Assert that nothing outside a region still points into it.
+ *
+ * This is the invariant a region rests on and the one D cannot check
+ * statically: BEAM can free a dead process's heap because every message was
+ * deep-copied on send, and nothing here copies. So the check is dynamic and
+ * costs a full mark of the thread's own roots, which is why it is off unless
+ * asked for. Turn it on in tests.
+ *
+ * Scans this thread's stacks, TLS and the global root tables, following
+ * everything reachable *outside* the region, and reports the first reference
+ * found into it. References from inside the region outward are fine and
+ * expected; only inbound ones are a bug.
+ */
+private void verifyRegionUnreferenced(ThreadHeap* heap, Region* reg) nothrow
+{
+    // Mark from every root *except* the region's own fiber stack. That stack
+    // legitimately holds references to region blocks while the region is still
+    // running -- the locals in the very frame calling this. Everywhere else is
+    // fair game: globals, TLS, the thread's own stack, and other fibers.
+    for (auto c = heap.allChunks; c; c = c.nextAll)
+        c.clearMarks();
+    for (auto r = heap.regions; r; r = r.next)
+        for (auto c = r.chunks; c; c = c.nextAll)
+            c.clearMarks();
+
+    heap.markLen = 0;
+    heap.verifyRegion = reg;
+    heap.verifyHit = null;
+
+    auto gc = cast(ThreadGC) gc_instance;
+    if (gc is null)
+        return;
+
+    auto cur = currentStackContext(ThreadBase.getThis());
+
+    // Contexts the running one is nested inside: the thread's own stack.
+    for (auto c = (cur !is null ? cur.within : null); c; c = c.within)
+        gc.markStackSpan(heap, c.tstack, c.bstack);
+
+    // Other fibers this thread owns.
+    immutable size_t n = gc.snapshotOwnedContexts(heap, cur);
+    foreach (i; 0 .. n)
+        gc.markStackSpan(heap, heap.stackSnap[i].pbot, heap.stackSnap[i].ptop);
+
+    gc.markTLS(heap);
+    gc.markRootsAndRanges(heap);
+    gc.drainMarkStack(heap);
+
+    auto hit = heap.verifyHit;
+    heap.verifyRegion = null;
+    heap.verifyHit = null;
+
+    assert(hit is null,
+        "tgc: a region block is still referenced from outside the region. " ~
+        "Anything that must outlive the region has to be copied out of it.");
+}
+
+extern (C) void* tgc_beginRegion() nothrow
+{
+    auto t = ThreadBase.getThis();
+    if (t is null)
+        return null;
+    auto ctx = currentStackContext(t);
+    if (ctx is null)
+        return null;
+
+    auto heap = currentHeap();
+    for (auto r = heap.regions; r; r = r.next)
+        if (r.ctx is ctx)
+            return null; // already open on this fiber
+
+    auto reg = cast(Region*) cstdlib.calloc(1, Region.sizeof);
+    if (!reg)
+        onOutOfMemoryError();
+    reg.owner = heap;
+    reg.ctx = ctx;
+    reg.next = heap.regions;
+    heap.regions = reg;
+
+    heap.cachedCtx = null;   // invalidate the routing cache
+    heap.cachedRegion = null;
+    atomicOp!"+="(activeRegions, 1);
+    return reg;
+}
+
+/**
+ * Close a region, releasing everything allocated in it without tracing.
+ *
+ * Finalizers run first, by walking the allocation bitmap. Nothing outside the
+ * region may still reference its blocks; `tgcRegionVerify` checks that in
+ * test builds.
+ */
+extern (C) void tgc_endRegion(void* handle) nothrow
+{
+    auto reg = cast(Region*) handle;
+    if (reg is null)
+        return;
+
+    auto heap = reg.owner;
+
+    if (atomicLoad(regionVerify))
+        verifyRegionUnreferenced(heap, reg);
+
+    // Unlink from the heap first, so nothing routes into it while it drains.
+    Region** pp = &heap.regions;
+    while (*pp !is null && *pp !is reg)
+        pp = &(*pp).next;
+    if (*pp is reg)
+        *pp = reg.next;
+    heap.cachedCtx = null;
+    heap.cachedRegion = null;
+
+    heap.finalizing = true;
+    auto c = reg.chunks;
+    while (c)
+    {
+        auto next = c.nextAll;
+        foreach (idx; 0 .. c.slotCount)
+        {
+            if (!c.isAllocated(idx))
+                continue;
+            immutable uint a = c.attrOf(idx);
+            if (a & (BlkAttr.FINALIZE | BlkAttr.STRUCTFINAL))
+                finalizeBlock(c.slotAt(idx), c.capacity(), a, c.meta[idx].ti);
+        }
+        auto raw = cast(ubyte*) c;
+        foreach (i; 0 .. c.runChunks)
+            heap.map.remove(cast(void*)(raw + i * chunkSize));
+        chunkFree(raw);
+        c = next;
+    }
+    heap.finalizing = false;
+
+    atomicOp!"-="(activeRegions, 1);
+    cstdlib.free(reg);
+}
+
+/// Bytes a region currently holds.
+extern (C) size_t tgc_regionBytes(void* handle) nothrow @nogc
+{
+    auto reg = cast(Region*) handle;
+    return reg is null ? 0 : reg.reservedBytes;
+}
+
+extern (C) void tgc_setRegionVerify(bool enable) nothrow @nogc
+{
+    atomicStore(regionVerify, enable);
+}
+
+extern (C) bool tgc_getRegionVerify() nothrow @nogc
+{
+    return atomicLoad(regionVerify);
+}
+
 private ThreadHeap* currentHeap() nothrow @nogc
 {
     if (tlsHeap)
@@ -1713,6 +1952,9 @@ private void threadInitHook(ThreadBase base) nothrow @nogc
     base.tlsGCData() = currentHeap();
 }
 
+/// The live collector instance, for code that runs outside a method call.
+private __gshared ThreadGC gc_instance;
+
 private GC initialize()
 {
     import core.lifetime : emplace;
@@ -1721,7 +1963,9 @@ private GC initialize()
     if (!gc)
         onOutOfMemoryError();
 
-    return emplace(gc);
+    auto inst = emplace(gc);
+    gc_instance = inst;
+    return inst;
 }
 
 /**
@@ -2253,6 +2497,35 @@ private:
         return BlkRef.init;
     }
 
+    /**
+     * The region bound to the running fiber, or null.
+     *
+     * Gated on `activeRegions` so a program that never opens a region pays a
+     * single predictable branch. When regions are in use this costs a thread
+     * lookup plus a pointer compare, because a fiber switch does not change
+     * TLS -- the running `StackContext` is what identifies the fiber.
+     */
+    static Region* currentRegion(ThreadHeap* heap) nothrow
+    {
+        if (atomicLoad!(MemoryOrder.raw)(activeRegions) == 0 || heap.regions is null)
+            return null;
+
+        auto ctx = currentStackContext(ThreadBase.getThis());
+        if (ctx is heap.cachedCtx)
+            return heap.cachedRegion;
+
+        Region* found;
+        for (auto r = heap.regions; r; r = r.next)
+            if (r.ctx is ctx)
+            {
+                found = r;
+                break;
+            }
+        heap.cachedCtx = ctx;
+        heap.cachedRegion = found;
+        return found;
+    }
+
     BlkRef alloc(size_t size, uint bits, bool zero, const TypeInfo ti) nothrow
     {
         auto heap = currentHeap();
@@ -2271,7 +2544,7 @@ private:
                 collectGlobal(this);
         }
 
-        auto b = heap.allocSlot(size);
+        auto b = heap.allocSlot(size, currentRegion(heap));
         b.setAttr(bits);
         auto m = b.meta();
         m.ti = cast(TypeInfo) ti;
@@ -2322,6 +2595,28 @@ private:
         heap.markLen = 0;
 
         immutable bool trackEscapes = atomicLoad(escapeTracking);
+
+        // Region chunks are seeded whole: everything in a region stays live
+        // until the region ends, and a region object may be the only thing
+        // keeping a thread-heap object alive, so they must be marked through.
+        for (auto r = heap.regions; r; r = r.next)
+            for (auto c = r.chunks; c; c = c.nextAll)
+            {
+                c.clearMarks();
+                foreach (idx; 0 .. c.slotCount)
+                {
+                    if (!c.isAllocated(idx))
+                        continue;
+                    c.setMarked(idx);
+                    immutable uint a = c.attrOf(idx);
+                    if (a & BlkAttr.NO_SCAN)
+                        continue;
+                    const(size_t)* bmp;
+                    size_t ew;
+                    if (layoutOf(c.meta[idx].ti, a, bmp, ew))
+                        heap.pushMark(c.slotAt(idx), c.capacity(), bmp, ew);
+                }
+            }
 
         // Clear this cycle's marks. With escape tracking on, also re-seed every
         // already-promoted block as a root: a promoted block may be unreachable
@@ -2416,7 +2711,7 @@ private:
     }
 
     @conservativeScan
-    void drainMarkStack(ThreadHeap* heap) nothrow
+    package void drainMarkStack(ThreadHeap* heap) nothrow
     {
         while (heap.markLen)
         {
@@ -2458,7 +2753,7 @@ private:
 
     /// Scan a stack range without caring which end is which.
     @conservativeScan
-    void markStackSpan(ThreadHeap* heap, void* a, void* b) nothrow
+    package void markStackSpan(ThreadHeap* heap, void* a, void* b) nothrow
     {
         if (!a || !b || a is b)
             return;
@@ -2493,7 +2788,7 @@ private:
      * fiber this thread created.
      */
     @conservativeScan
-    void markStacks(ThreadHeap* heap, void* sp) nothrow
+    package void markStacks(ThreadHeap* heap, void* sp) nothrow
     {
         auto t = ThreadBase.getThis();
         auto cur = currentStackContext(t);
@@ -2523,7 +2818,7 @@ private:
      * for the snapshot keeps a collection from blocking fiber creation for the
      * whole mark.
      */
-    size_t snapshotOwnedContexts(ThreadHeap* heap, StackContext* cur) nothrow
+    package size_t snapshotOwnedContexts(ThreadHeap* heap, StackContext* cur) nothrow
     {
         auto lock = threadListLock();
         lock.lock_nothrow();
@@ -2580,7 +2875,7 @@ private:
     }
 
     @conservativeScan
-    void markTLS(ThreadHeap* heap) nothrow
+    package void markTLS(ThreadHeap* heap) nothrow
     {
         // Read fresh each collection: the handle is installed during thread
         // registration, which happens after the pre-registration thread init
@@ -2600,7 +2895,7 @@ private:
      * addRoot/addRange spin for the whole collection — a global pause in all
      * but name, which is the one thing tgc exists to avoid.
      */
-    void markRootsAndRanges(ThreadHeap* heap) nothrow
+    package void markRootsAndRanges(ThreadHeap* heap) nothrow
     {
         size_t nroots, nranges;
 
@@ -2684,6 +2979,14 @@ private:
         auto c = b.chunk;
         if (c.isMarked(b.idx))
             return;
+        if (heap.verifyRegion !is null && c.region is heap.verifyRegion)
+        {
+            // Reached a region block from outside the region: the invariant
+            // the caller asserted does not hold.
+            if (heap.verifyHit is null)
+                heap.verifyHit = b.payload();
+            return;
+        }
         c.setMarked(b.idx);
         // The global closure is computed first and to completion, so anything
         // marked during that pass is reachable from a global and gets promoted.

@@ -106,6 +106,20 @@ reachable and untested — is the worst of the three.
 
 ## Open — smaller items
 
+### -1. Regions do not nest, and a throw out of one is a trap
+
+`tgcBeginRegion` returns null on a fiber that already has a region open, because
+a nested region's blocks would be freed while the outer one still ran. That is
+the safe answer but not a useful one; scoped nesting would need a stack of
+regions per fiber and per-region chunk ownership, which is a bigger change than
+it sounds.
+
+The sharper hazard is an exception thrown out of a region: it is allocated
+inside and caught outside, so it dangles. `tgcRunInRegion` closes the region on
+the way out but cannot copy the exception, and the verifier will flag it only
+if the catch site is reachable from a scanned root at close time. Documented,
+not solved.
+
 ### 0. Marking is now the bottleneck, and it is conservative scanning itself
 
 With the free list gone, the self-time profile on binary-trees is `markPtr`

@@ -116,6 +116,86 @@ bool tgcPreciseScanning() nothrow @nogc
     return tgc_getPreciseScanning();
 }
 
+/**
+ * A request-scoped arena bound to the running fiber.
+ *
+ * Everything allocated while the region is open comes from chunks it owns
+ * exclusively, and closing it releases the lot without tracing — the BEAM
+ * model, where a process dies and its heap goes with it.
+ *
+ * It carries BEAM's precondition too. BEAM can free a dead process's heap
+ * because every message was deep-copied on send, so nothing outside can point
+ * in. D has no such enforcement, so **anything that must outlive the region has
+ * to be copied out of it**, and that is your invariant to keep. Session state,
+ * a keep-alive connection object, a log buffer flushed later, a cache entry
+ * populated mid-request — each is a dangling pointer if it stays in the region.
+ *
+ * Enable `tgcRegionVerify` in tests: it checks the invariant dynamically at
+ * every close, at the cost of a full mark, and is off by default for that
+ * reason.
+ *
+ * Regions do not nest. Opening one on a fiber that already has one returns
+ * null and changes nothing.
+ *
+ * ---
+ * void handleRequest(int fd)
+ * {
+ *     auto r = tgcBeginRegion();
+ *     scope (exit) tgcEndRegion(r);
+ *     // ... parse, route, render, send ...
+ * }   // every allocation above is released here, untraced
+ * ---
+ */
+void* tgcBeginRegion()
+{
+    return tgc_beginRegion();
+}
+
+/// ditto
+void tgcEndRegion(void* region)
+{
+    tgc_endRegion(region);
+}
+
+/// Bytes a region currently holds.
+size_t tgcRegionBytes(void* region) nothrow @nogc
+{
+    return tgc_regionBytes(region);
+}
+
+/**
+ * Run `body` inside a region, closing it afterwards even if `body` throws.
+ *
+ * A throw is the case most likely to break the invariant: the exception is
+ * allocated inside the region and caught outside it. Copy anything you need out
+ * of it before it propagates.
+ */
+void tgcRunInRegion(scope void delegate() body)
+{
+    auto r = tgcBeginRegion();
+    scope (exit)
+        tgcEndRegion(r);
+    body();
+}
+
+/**
+ * Check at every region close that nothing outside still points into it.
+ *
+ * Costs a full mark of the thread's roots per close, so it is off by default.
+ * Turn it on in test builds: it converts "I believe nothing escapes" into
+ * something your suite verifies.
+ */
+void tgcRegionVerify(bool enable) nothrow @nogc
+{
+    tgc_setRegionVerify(enable);
+}
+
+/// ditto
+bool tgcRegionVerify() nothrow @nogc
+{
+    return tgc_getRegionVerify();
+}
+
 version (Tgc_default)
 {
     extern (C) __gshared string[] rt_options = [ "gcopt=gc:tgc" ];

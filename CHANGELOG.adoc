@@ -193,6 +193,37 @@ Scaling is now linear rather than quadratic.
 
 === Added
 
+* *Fiber-scoped regions* — `tgcBeginRegion` / `tgcEndRegion` / `tgcRunInRegion`,
+  with `tgcRegionVerify` and `tgcRegionBytes`. Everything allocated while a
+  region is open comes from chunks it owns exclusively, and closing it releases
+  the lot without tracing: the BEAM model, where a process dies and its heap
+  goes with it.
++
+The payoff is not the sweep, which was already cheap; it is that request-scoped
+memory never has to be *proved* dead, so it never enters the mark phase. A
+handler loop allocating 200 blocks per request over 4000 requests:
++
+[cols="1,1,1"]
+|===
+| | time | collections
+
+| without a region | 58.5 ms | 799
+| with a region | 36.3 ms | *0*
+|===
++
+Regions are bound to the running fiber rather than to thread-local state,
+because fibers on a thread share TLS and a `yield` would otherwise route the
+next fiber's allocations into the wrong region. Resolution is gated on a global
+counter, so a program that never opens a region pays one predictable branch:
+allocation is unchanged at 11.03 ns.
++
+The precondition is BEAM's, without BEAM's enforcement. BEAM can free a dead
+process's heap because every message is deep-copied on send; nothing here
+copies, so *anything that must outlive a region has to be copied out of it* and
+that is the caller's invariant. `tgcRegionVerify(true)` checks it dynamically at
+every close — off by default because it costs a full mark — and is worth
+enabling in test builds.
+
 * `tgcCollectGlobal()` and `tgcGlobalThreshold(size_t)` — cooperative global
   collection, the only thing that can reclaim memory a thread-local collection
   cannot prove dead: arenas adopted from exited threads, and blocks promoted by
