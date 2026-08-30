@@ -45,3 +45,33 @@ buildType "unittest-asan" {
     dflags "-fsanitize=address"
     versions "TgcSanitize"
 }
+
+// Benchmarks. The mark phase is the collector's largest cost, so a change to it
+// has to be measured rather than reasoned about; `bench/run.sh` drives these.
+//
+// Each is a normal executable with tgc linked in, so the collector is chosen at
+// runtime with `--DRT-gcopt=gc:` and both columns of a comparison run the same
+// binary.
+configuration "bench-bintree" {
+    targetType "executable"
+    targetName "bench-bintree"
+    sourcePaths "source"
+    sourceFiles "bintree.d"
+    mainSourceFile "bintree.d"
+}
+
+configuration "bench-mt" {
+    targetType "executable"
+    targetName "bench-mt"
+    sourcePaths "source"
+    sourceFiles "bintree_mt.d"
+    mainSourceFile "bintree_mt.d"
+}
+
+configuration "bench-region" {
+    targetType "executable"
+    targetName "bench-region"
+    sourcePaths "source"
+    sourceFiles "bintree_region.d"
+    mainSourceFile "bintree_region.d"
+}

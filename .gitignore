@@ -16,3 +16,7 @@ dub.selections.json
 /tgc
 /tgc-test-*
 /libtgc.*
+/bench-bintree
+/bench-mt
+/bench-region
+/bench/results/

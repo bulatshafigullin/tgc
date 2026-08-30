@@ -1,5 +1,7 @@
 @safe:
 import std;
+import core.memory : GC;
+import core.stdc.stdio : fprintf, stderr;
 
 extern(C) __gshared string[] rt_options = [ "gcopt=minPoolSize:300" ];
 
@@ -54,4 +56,15 @@ void main(string[] args)
     }
 
     writeln(format("long lived tree of depth %d\t check: %d", maxDepth, longLivedTree.check()));
+
+    // Collection count and pause total, so a run says what the collector did
+    // and not only how long the program took. stderr, so the checksum output
+    // stays byte-identical between collectors.
+    () @trusted {
+        auto ps = GC.profileStats();
+        fprintf(stderr, "GC: collections=%zu totalPause=%.1f ms maxPause=%.2f ms\n",
+            ps.numCollections,
+            ps.totalPauseTime.total!"usecs" / 1000.0,
+            ps.maxPauseTime.total!"usecs" / 1000.0);
+    }();
 }
