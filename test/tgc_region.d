@@ -63,8 +63,10 @@ unittest
         }
 
         assert(tgcRegionBytes(r) > 0, "region reported no memory");
+        // Query before closing: the handle is freed by tgcEndRegion, so
+        // touching it afterwards is a use-after-free. ThreadSanitizer caught
+        // exactly that here.
         tgcEndRegion(r);
-        assert(tgcRegionBytes(r) == 0 || true);
     });
     f.call();
     assert(f.state == Fiber.State.TERM);

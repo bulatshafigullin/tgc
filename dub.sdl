@@ -35,7 +35,9 @@ buildType "unittest-optimized" {
 buildType "unittest-tsan" {
     buildOptions "unittests" "debugInfo"
     dflags "-fsanitize=thread"
-    versions "TgcSanitize"
+    // TgcTSan gates the __tsan_* happens-before annotations, which only exist
+    // when linking against the thread sanitizer runtime.
+    versions "TgcSanitize" "TgcTSan"
 }
 
 buildType "unittest-asan" {

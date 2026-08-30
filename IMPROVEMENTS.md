@@ -247,30 +247,41 @@ concurrent mutator at all, so it needs no barrier for the common case.
 The instance is `malloc`'d and `emplace`'d; `roots`/`ranges` leak at shutdown.
 Harmless in practice, untidy.
 
-### 10. Sanitizers still have not run — CI remains their first execution
+### 10. Sanitizers: run, and clean
 
-Both runtimes are broken for D on the development machine (macOS 15.5 / arm64,
-LDC 1.42). ASan deadlocks inside its own startup; TSan segfaults before `main`.
-Both were confirmed against controls containing none of this project's code:
+Both now run clean on Linux/x86-64 with LDC 1.42 — the first time either has
+executed against this project. They still cannot run on macOS/arm64, where ASan
+deadlocks in its own startup and TSan segfaults before `main`, both reproducible
+with a `printf("hello")` program containing none of this code.
 
-* a `printf("hello")` D program fails identically under each;
-* the same program **in C**, built with clang, runs fine under both;
-* even `-betterC` (no druntime at all) segfaults under TSan.
+ThreadSanitizer went from 68 warnings to zero, and the path there is worth
+recording because most of it was not bugs:
 
-So the fault is in LDC's sanitizer support on this platform, not in tgc or in
-druntime. The CI jobs target `ubuntu-latest` and will be the first real
-execution.
+* **~20 were TSan blindness to druntime's `SpinLock`.** A four-thread counter
+  guarded by it comes out exact, so the lock works; TSan just cannot see the
+  edge. Annotating acquire and release with `__tsan_acquire`/`__tsan_release`
+  fixed it — better than suppressing, because those structures stay checked.
+* **~10 were the conservative scan itself**, which reads whole stacks and the
+  data segment while other threads mutate them. The scan routines already
+  carried `@noSanitize("address")`; they needed `"thread"` too. Two of them had
+  silently lost the attribute in an earlier refactor.
+* **~5 were the world-stopped section** of the global collection, where the
+  synchronisation is a signal handshake TSan cannot model. Wrapped in
+  `__tsan_ignore_thread_begin/end`.
+* **29 were druntime's own** `thread_suspendHandler` failing to save `errno`.
+  Suppressed, with a note that it is not tgc's to fix.
 
-Two concrete things were fixed while trying:
+Two real defects came out of it: a use-after-free in `test/tgc_region.d` that
+queried a region handle after freeing it, and — introduced while adding the
+annotations — three sites where `scope (exit) tsanRelease(...); lock.unlock();`
+released the lock *immediately* rather than on scope exit, because D binds only
+the first statement to the guard. That one is exactly the class of bug the tool
+exists for.
 
-* **The CI sanitizer job could never have worked.** It passed `--dflags=...`
-  to `dub test`, which dub rejects outright (`Unknown command line flags`). The
-  flags now live in `unittest-tsan` / `unittest-asan` build types in `dub.sdl`,
-  both verified to compile and link against the real sanitizer runtimes.
-* **The audit a sanitizer would have done was done by hand**, which found a real
-  data race — see below.
-
-Expect the first CI sanitizer run to need tuning rather than to be green.
+AddressSanitizer reports zero errors. Two reclamation assertions are skipped
+under `TgcSanitize`: ASan's redzones and quarantine change the stack layout
+enough that a conservative collector never lets the objects go. Reclamation is
+covered by the ordinary builds; the sanitizer run is checking safety.
 
 ### 11. One race is fixed by inspection, not by a reproducing test
 

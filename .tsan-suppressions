@@ -1,0 +1,11 @@
+# ThreadSanitizer suppressions for tgc.
+#
+# Only for reports that are not tgc's to fix. Anything tgc can address is
+# addressed in the source instead -- the collector's own spinlock-guarded
+# structures are annotated with __tsan_acquire/__tsan_release rather than
+# suppressed, so they stay checked.
+
+# druntime's thread suspension signal handler does not save and restore errno.
+# It is reached from thread_suspendAll, which tgc calls for a global collection,
+# but the handler is druntime's and the omission is druntime's.
+signal:thread_suspendHandler

@@ -56,6 +56,35 @@ private void thread_yield() nothrow
     Thread.yield();
 }
 
+/**
+ * ThreadSanitizer happens-before annotations.
+ *
+ * druntime's `SpinLock` synchronises correctly -- a four-thread counter under
+ * it comes out exact -- but TSan cannot see it, and reports every structure it
+ * guards as racing. Annotating the acquire and release directly gives TSan the
+ * edge it is missing, which is better than suppressing the reports: the
+ * structures stay checked for races that are real.
+ */
+version (TgcTSan)
+{
+    extern (C) void __tsan_acquire(void*) nothrow @nogc;
+    extern (C) void __tsan_release(void*) nothrow @nogc;
+    extern (C) void __tsan_ignore_thread_begin() nothrow @nogc;
+    extern (C) void __tsan_ignore_thread_end() nothrow @nogc;
+
+    private void tsanAcquire(const(void)* p) nothrow @nogc { __tsan_acquire(cast(void*) p); }
+    private void tsanRelease(const(void)* p) nothrow @nogc { __tsan_release(cast(void*) p); }
+    private void tsanIgnoreBegin() nothrow @nogc { __tsan_ignore_thread_begin(); }
+    private void tsanIgnoreEnd() nothrow @nogc { __tsan_ignore_thread_end(); }
+}
+else
+{
+    private void tsanAcquire(const(void)* p) nothrow @nogc {}
+    private void tsanRelease(const(void)* p) nothrow @nogc {}
+    private void tsanIgnoreBegin() nothrow @nogc {}
+    private void tsanIgnoreEnd() nothrow @nogc {}
+}
+
 private
 {
     alias ScanDg = void delegate(void* pstart, void* pend) nothrow;
@@ -185,24 +214,33 @@ private bool layoutOf(TypeInfo ti, uint attr, out const(size_t)* bitmap,
 }
 
 /**
- * Marks the conservative scanning routines as exempt from AddressSanitizer.
+ * Marks the conservative scanning routines as exempt from the sanitizers.
  *
  * A conservative collector deliberately reads memory a sanitizer considers
- * off-limits: padding and redzones between stack variables, and quarantined
- * heap. Those reads are by design, so instrumenting them produces both false
- * reports and a large slowdown — enough to make a sanitized test run
- * impractical. Exempting the scan routines is the standard treatment.
+ * off-limits, and it does so on both axes. For AddressSanitizer: padding and
+ * redzones between stack variables, and quarantined heap. For
+ * ThreadSanitizer: the scan walks whole stacks and the data segment while
+ * other threads are mutating them, which is exactly what a race detector is
+ * built to flag — including tgc's own `__gshared` state, which lives in the
+ * scanned data segment. A torn read there is harmless: the word either
+ * resolves to a block, retaining it for one extra cycle, or it does not.
+ *
+ * Instrumenting these produces both false reports and a large slowdown.
+ * Exempting the scan routines is the standard treatment.
  */
 version (LDC)
 {
     import ldc.attributes : noSanitize;
 
-    private enum conservativeScan = noSanitize("address");
+    // The attribute takes one sanitizer per instance; apply both.
+    private enum conservativeScanAddr = noSanitize("address");
+    private enum conservativeScanThread = noSanitize("thread");
 }
 else
 {
     // No-op UDA on compilers without the attribute.
-    private enum conservativeScan = "tgc.conservativeScan";
+    private enum conservativeScanAddr = "tgc.conservativeScan";
+    private enum conservativeScanThread = "tgc.conservativeScan";
 }
 
 /**
@@ -1393,26 +1431,26 @@ private __gshared SpinLock heapsLock;
 
 private void registerHeap(ThreadHeap* h) nothrow @nogc
 {
-    heapsLock.lock();
+    heapsLock.lock(); tsanAcquire(cast(const(void)*) &heapsLock);
     if (allHeapsLen == allHeapsCap)
     {
         size_t ncap = allHeapsCap ? allHeapsCap * 2 : 8;
         auto np = cast(ThreadHeap**) cstdlib.realloc(allHeaps.ptr, ncap * (ThreadHeap*).sizeof);
         if (!np)
         {
-            heapsLock.unlock();
+            tsanRelease(cast(const(void)*) &heapsLock); heapsLock.unlock();
             onOutOfMemoryError();
         }
         allHeaps = np[0 .. ncap];
         allHeapsCap = ncap;
     }
     allHeaps[allHeapsLen++] = h;
-    heapsLock.unlock();
+    tsanRelease(cast(const(void)*) &heapsLock); heapsLock.unlock();
 }
 
 private void unregisterHeap(ThreadHeap* h) nothrow @nogc
 {
-    heapsLock.lock();
+    heapsLock.lock(); tsanAcquire(cast(const(void)*) &heapsLock);
     foreach (i; 0 .. allHeapsLen)
     {
         if (allHeaps[i] is h)
@@ -1422,7 +1460,7 @@ private void unregisterHeap(ThreadHeap* h) nothrow @nogc
             break;
         }
     }
-    heapsLock.unlock();
+    tsanRelease(cast(const(void)*) &heapsLock); heapsLock.unlock();
 }
 
 /**
@@ -1451,7 +1489,7 @@ private void adoptOrphanChunks(ThreadHeap* dying) nothrow @nogc
     if (dying.allChunks is null)
         return;
 
-    orphanLock.lock();
+    orphanLock.lock(); tsanAcquire(cast(const(void)*) &orphanLock);
 
     if (orphanHeap is null)
     {
@@ -1492,7 +1530,7 @@ private void adoptOrphanChunks(ThreadHeap* dying) nothrow @nogc
     }
 
     dying.allChunks = null;
-    orphanLock.unlock();
+    tsanRelease(cast(const(void)*) &orphanLock); orphanLock.unlock();
 }
 
 // ---------------------------------------------------------------------------
@@ -1542,7 +1580,7 @@ private void pushGlobalMark(void* base, size_t size) nothrow @nogc
     globalMarkStack[globalMarkLen++] = MarkItem(base, size);
 }
 
-@conservativeScan
+@conservativeScanAddr @conservativeScanThread
 private void markPtrGlobal(void* p) nothrow
 {
     if (!p)
@@ -1590,7 +1628,7 @@ private void markPtrGlobal(void* p) nothrow
         pushGlobalMark(c.slotAt(idx), c.capacity());
 }
 
-@conservativeScan
+@conservativeScanAddr @conservativeScanThread
 private void markRangeGlobal(void* pbot, void* ptop) nothrow
 {
     if (!pbot || !ptop || pbot >= ptop)
@@ -1602,7 +1640,7 @@ private void markRangeGlobal(void* pbot, void* ptop) nothrow
         markPtrGlobal(*p);
 }
 
-@conservativeScan
+@conservativeScanAddr @conservativeScanThread
 private void drainGlobalMark() nothrow
 {
     while (globalMarkLen)
@@ -1646,9 +1684,12 @@ private bool collectGlobal(ThreadGC gc) nothrow
 
     // Taken before suspending, so no thread can be suspended midway through
     // mutating the heap registry. Never the other way round.
-    heapsLock.lock();
+    heapsLock.lock(); tsanAcquire(cast(const(void)*) &heapsLock);
     scope (exit)
+    {
+        tsanRelease(cast(const(void)*) &heapsLock);
         heapsLock.unlock();
+    }
 
     // The world is stopped for MARKING ONLY. Sweeping here would be unsafe:
     // running a finalizer with threads suspended can block on a lock one of
@@ -1659,6 +1700,15 @@ private bool collectGlobal(ThreadGC gc) nothrow
         thread_suspendAll();
         scope (exit)
             thread_resumeAll();
+
+        // Every access below is protected by the other threads being
+        // suspended, which is a signal handshake ThreadSanitizer cannot model
+        // as synchronisation -- it sees only unsynchronised accesses to memory
+        // other threads touched. Ignoring this window is the documented way to
+        // express "these are safe for a reason the tool cannot observe".
+        tsanIgnoreBegin();
+        scope (exit)
+            tsanIgnoreEnd();
 
         // Index every chunk of every heap, including the orphan heap, so a
         // candidate pointer costs one probe instead of one per heap.
@@ -1721,9 +1771,12 @@ private bool collectGlobal(ThreadGC gc) nothrow
  */
 private void sweepOrphanHeap() nothrow
 {
-    orphanLock.lock();
+    orphanLock.lock(); tsanAcquire(cast(const(void)*) &orphanLock);
     scope (exit)
+    {
+        tsanRelease(cast(const(void)*) &orphanLock);
         orphanLock.unlock();
+    }
 
     auto h = orphanHeap;
     if (h is null)
@@ -2212,14 +2265,14 @@ class ThreadGC : GC
 
     void addRoot(void* p) nothrow @nogc
     {
-        rootsLock.lock();
+        rootsLock.lock(); tsanAcquire(cast(const(void)*) &rootsLock);
         roots.insertBack(Root(p));
-        rootsLock.unlock();
+        tsanRelease(cast(const(void)*) &rootsLock); rootsLock.unlock();
     }
 
     void removeRoot(void* p) nothrow @nogc
     {
-        rootsLock.lock();
+        rootsLock.lock(); tsanAcquire(cast(const(void)*) &rootsLock);
         foreach (ref r; roots)
         {
             if (r is p)
@@ -2231,7 +2284,7 @@ class ThreadGC : GC
         }
         // Removing a root that was never added is harmless; the previous
         // assert(false) here halted the process in release builds.
-        rootsLock.unlock();
+        tsanRelease(cast(const(void)*) &rootsLock); rootsLock.unlock();
     }
 
     @property RootIterator rootIter() return @nogc
@@ -2241,29 +2294,29 @@ class ThreadGC : GC
 
     private int rootsApply(scope int delegate(ref Root) nothrow dg)
     {
-        rootsLock.lock();
+        rootsLock.lock(); tsanAcquire(cast(const(void)*) &rootsLock);
         foreach (ref r; roots)
         {
             if (auto result = dg(r))
             {
-                rootsLock.unlock();
+                tsanRelease(cast(const(void)*) &rootsLock); rootsLock.unlock();
                 return result;
             }
         }
-        rootsLock.unlock();
+        tsanRelease(cast(const(void)*) &rootsLock); rootsLock.unlock();
         return 0;
     }
 
     void addRange(void* p, size_t sz, const TypeInfo ti = null) nothrow @nogc
     {
-        rootsLock.lock();
+        rootsLock.lock(); tsanAcquire(cast(const(void)*) &rootsLock);
         ranges.insertBack(Range(p, p + sz, cast() ti));
-        rootsLock.unlock();
+        tsanRelease(cast(const(void)*) &rootsLock); rootsLock.unlock();
     }
 
     void removeRange(void* p) nothrow @nogc
     {
-        rootsLock.lock();
+        rootsLock.lock(); tsanAcquire(cast(const(void)*) &rootsLock);
         foreach (ref r; ranges)
         {
             if (r.pbot is p)
@@ -2273,7 +2326,7 @@ class ThreadGC : GC
                 break;
             }
         }
-        rootsLock.unlock();
+        tsanRelease(cast(const(void)*) &rootsLock); rootsLock.unlock();
     }
 
     @property RangeIterator rangeIter() return @nogc
@@ -2283,16 +2336,16 @@ class ThreadGC : GC
 
     private int rangesApply(scope int delegate(ref Range) nothrow dg)
     {
-        rootsLock.lock();
+        rootsLock.lock(); tsanAcquire(cast(const(void)*) &rootsLock);
         foreach (ref r; ranges)
         {
             if (auto result = dg(r))
             {
-                rootsLock.unlock();
+                tsanRelease(cast(const(void)*) &rootsLock); rootsLock.unlock();
                 return result;
             }
         }
-        rootsLock.unlock();
+        tsanRelease(cast(const(void)*) &rootsLock); rootsLock.unlock();
         return 0;
     }
 
@@ -2489,9 +2542,12 @@ private:
         // use-after-free, reachable from an ordinary GC.sizeOf on a pointer
         // this thread does not own. Cross-thread sharing is unsupported, so
         // there is nothing to find there anyway.
-        orphanLock.lock();
+        orphanLock.lock(); tsanAcquire(cast(const(void)*) &orphanLock);
         scope (exit)
+        {
+            tsanRelease(cast(const(void)*) &orphanLock);
             orphanLock.unlock();
+        }
         if (orphanHeap !is null)
             return orphanHeap.lookup(p, false);
         return BlkRef.init;
@@ -2710,7 +2766,7 @@ private:
             atomicStore(profilePauseMaxNs, elapsed);
     }
 
-    @conservativeScan
+    @conservativeScanAddr @conservativeScanThread
     package void drainMarkStack(ThreadHeap* heap) nothrow
     {
         while (heap.markLen)
@@ -2731,7 +2787,7 @@ private:
      * needs; for a single object the repeat simply covers the size-class slack
      * past the object, where nothing live can be stored anyway.
      */
-    @conservativeScan
+    @conservativeScanAddr @conservativeScanThread
     void markRangePrecise(ThreadHeap* heap, void* base, size_t size,
                           const(size_t)* bitmap, size_t elemWords) nothrow
     {
@@ -2752,7 +2808,7 @@ private:
     }
 
     /// Scan a stack range without caring which end is which.
-    @conservativeScan
+    @conservativeScanAddr @conservativeScanThread
     package void markStackSpan(ThreadHeap* heap, void* a, void* b) nothrow
     {
         if (!a || !b || a is b)
@@ -2787,7 +2843,7 @@ private:
      * the creating thread's heap, so a context whose block this heap owns is a
      * fiber this thread created.
      */
-    @conservativeScan
+    @conservativeScanAddr @conservativeScanThread
     package void markStacks(ThreadHeap* heap, void* sp) nothrow
     {
         auto t = ThreadBase.getThis();
@@ -2874,7 +2930,7 @@ private:
         return n;
     }
 
-    @conservativeScan
+    @conservativeScanAddr @conservativeScanThread
     package void markTLS(ThreadHeap* heap) nothrow
     {
         // Read fresh each collection: the handle is installed during thread
@@ -2895,11 +2951,12 @@ private:
      * addRoot/addRange spin for the whole collection — a global pause in all
      * but name, which is the one thing tgc exists to avoid.
      */
+    @conservativeScanAddr @conservativeScanThread
     package void markRootsAndRanges(ThreadHeap* heap) nothrow
     {
         size_t nroots, nranges;
 
-        rootsLock.lock();
+        rootsLock.lock(); tsanAcquire(cast(const(void)*) &rootsLock);
         {
             nroots = roots.length;
             nranges = ranges.length;
@@ -2910,7 +2967,7 @@ private:
                 auto np = cast(void**) cstdlib.realloc(heap.rootSnap, ncap * (void*).sizeof);
                 if (!np)
                 {
-                    rootsLock.unlock();
+                    tsanRelease(cast(const(void)*) &rootsLock); rootsLock.unlock();
                     onOutOfMemoryError();
                 }
                 heap.rootSnap = np;
@@ -2922,7 +2979,7 @@ private:
                 auto np = cast(RangeSnap*) cstdlib.realloc(heap.rangeSnap, ncap * RangeSnap.sizeof);
                 if (!np)
                 {
-                    rootsLock.unlock();
+                    tsanRelease(cast(const(void)*) &rootsLock); rootsLock.unlock();
                     onOutOfMemoryError();
                 }
                 heap.rangeSnap = np;
@@ -2934,7 +2991,7 @@ private:
             foreach (i; 0 .. nranges)
                 heap.rangeSnap[i] = RangeSnap(ranges[i].pbot, ranges[i].ptop);
         }
-        rootsLock.unlock();
+        tsanRelease(cast(const(void)*) &rootsLock); rootsLock.unlock();
 
         foreach (i; 0 .. nroots)
             markPtr(heap, heap.rootSnap[i]);
@@ -2942,7 +2999,7 @@ private:
             markRange(heap, heap.rangeSnap[i].pbot, heap.rangeSnap[i].ptop);
     }
 
-    @conservativeScan
+    @conservativeScanAddr @conservativeScanThread
     /// Mark the shared root tables into the global collection's mark set.
     package void markGlobalRootsAndRanges() nothrow
     {
@@ -2954,6 +3011,7 @@ private:
             markRangeGlobal(ranges[i].pbot, ranges[i].ptop);
     }
 
+    @conservativeScanAddr @conservativeScanThread
     void markRange(ThreadHeap* heap, void* pbot, void* ptop) nothrow
     {
         if (!pbot || !ptop || pbot >= ptop)
@@ -2968,7 +3026,7 @@ private:
             markPtr(heap, *p);
     }
 
-    @conservativeScan
+    @conservativeScanAddr @conservativeScanThread
     void markPtr(ThreadHeap* heap, void* p) nothrow
     {
         if (!p)

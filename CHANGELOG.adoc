@@ -266,6 +266,19 @@ at collection time, so a block published and unpublished entirely between two
 collections is never seen; and promoted blocks accumulate until a cooperative
 global collection exists to reclaim them.
 
+=== Fixed — found by ThreadSanitizer
+
+* *Use-after-free in `test/tgc_region.d`*, which queried a region handle after
+  `tgcEndRegion` had freed it.
+* *Three locks released immediately instead of on scope exit.* Introduced while
+  adding the TSan annotations: `scope (exit) tsanRelease(...); lock.unlock();`
+  binds only the first statement to the guard, so the unlock ran straight away.
+  This affected `collectGlobal`'s hold on `heapsLock` and two `orphanLock`
+  sites. TSan caught it immediately -- the races it had stopped reporting came
+  back the moment the bug appeared.
+* Two scan routines (`markRange`, `markRootsAndRanges`) had silently lost their
+  sanitizer exemption in an earlier refactor.
+
 === Infrastructure
 
 * Converted `AGENTS.md`, `README.adoc`, `LICENSE`, `.gitignore`,
@@ -274,7 +287,19 @@ global collection exists to reclaim them.
   pipeline could not run, and `.gitignore` matched nothing.
 * Added `.gitattributes` enforcing UTF-8 and LF.
 * Added a CI workflow: DMD and LDC across Linux/macOS/Windows, an encoding
-  guard, and AddressSanitizer/ThreadSanitizer jobs.
+  guard, and AddressSanitizer/ThreadSanitizer jobs. Both sanitizers have now
+  been run against the collector on Linux/x86-64 and report nothing: TSan zero
+  warnings across three consecutive runs, ASan zero errors. They remain
+  unrunnable on macOS/arm64, where both runtimes fail on a bare
+  `printf("hello")`.
+* tgc's spinlock-guarded structures carry `__tsan_acquire`/`__tsan_release`
+  annotations rather than suppressions, because TSan cannot see through
+  druntime's `SpinLock` -- verified with a four-thread counter that is exact
+  under the lock yet still reported as racing. Annotating keeps those
+  structures checked. The world-stopped section of a global collection is
+  wrapped in `__tsan_ignore_thread_begin/end`, since suspension is a signal
+  handshake TSan cannot model. `.tsan-suppressions` covers only druntime's own
+  `thread_suspendHandler`, which does not preserve `errno`.
 * Added `test/tgc_safety.d`, an adversarial suite covering reachability
   (TLS-only, `__gshared`-only, `addRoot`-only, interior and one-past-the-end
   pointers), alignment, reclamation, `disable()` semantics, finalization at
