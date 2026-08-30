@@ -116,10 +116,26 @@ project has, and three cheap explanations have already been tested and rejected:
 a one-entry chunk cache (48% hit, cost more than it saved), 1 MiB chunks so the
 map stays in L1 (6%), and precise scanning (4–6%, already shipped).
 
-Separately and more tractably, 7.8% of runtime is *kernel page management* —
-`clear_page_erms` and `folio_*`. `releaseChunk` hands empty 64 KiB chunks back
-to the allocator on every sweep and the next allocation faults them in again. A
-small free-chunk cache should remove most of that, and is a bounded change.
+**Tried and rejected: a free-chunk cache.** `perf` puts 7.8% of runtime in
+kernel page management (`clear_page_erms`, `folio_*`), which looked like chunk
+churn — `releaseChunk` returning empty 64 KiB chunks and the next allocation
+faulting them back in. Holding 16 chunks back per thread, including on region
+teardown where churn is heaviest, moved nothing:
+
+| workload | no cache | with cache |
+|---|---|---|
+| binary-trees d18 | 5.183 s | 5.174 s |
+| region benchmark, no regions | 0.105 s | 0.103 s |
+| region benchmark, regions | 0.058 s | 0.058 s |
+
+The cache was genuinely being used — 65% hit rate on the non-region path — so
+chunk allocation and freeing simply are not expensive at these rates. The kernel
+page time must come from faulting in the heap as it *grows* to its steady size,
+which no cache can avoid. Reverted rather than carry 30 lines and a delayed
+memory-return for ~2%.
+
+That leaves marking as the only lever worth pulling here, and four cheap
+explanations for it have now been tested and rejected.
 
 ### -1. Regions do not nest, and a throw out of one is a trap
 

@@ -45,10 +45,13 @@ Where tgc's time goes (`perf`, depth 18):
 | sweep (`freeSlot`) | 2.6% |
 | the benchmark itself (`Node.check` + `Node.create`) | 4.4% |
 
-The kernel share is a finding in its own right: `releaseChunk` returns empty
-64 KiB chunks to the allocator during every sweep, and the next allocation
-faults them back in and has them zeroed. A small cache of free chunks would
-remove most of it — a bounded change worth doing before anything harder.
+The kernel share looked like chunk churn — `releaseChunk` returning empty
+64 KiB chunks each sweep, the next allocation faulting them back in. It is not.
+A 16-chunk-per-thread cache, wired into region teardown as well, changed the
+binary-trees figure by 0.2% and the region benchmark by nothing, despite a 65%
+hit rate. Chunk allocation is not expensive at these rates; the page time comes
+from faulting in the heap as it grows to its steady size, which caching cannot
+avoid. The experiment was reverted — see `IMPROVEMENTS.md`.
 
 ## Multi-threaded (`bintree_mt.d`)
 
