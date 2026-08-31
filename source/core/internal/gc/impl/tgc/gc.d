@@ -11,10 +11,16 @@
  * than by searching. That keeps the mark phase linear in live data instead of
  * quadratic in block count.
  *
- * Cross-thread pointer sharing of GC blocks is unsupported in v1 except via
- * explicit ownership transfer that returns memory through a remote free list.
- * Prefer copy or `immutable` message passing (`std.concurrency`). Partitioned
- * shared regions are planned as Phase 2.
+ * Heaps are strictly thread-private. A block belongs to the thread that
+ * allocated it, and only that thread may free, resize or re-attribute it; no
+ * collection ever searches another thread's heap. Pass ownership by copying or
+ * by `immutable` (`std.concurrency`), not by pointer.
+ *
+ * This used to be documented as "unsupported except via explicit ownership
+ * transfer through a remote free list". That path is gone -- it could not be
+ * made sound without scanning the receiving thread's stack, which is the one
+ * thing this collector does not do -- and passing a block across threads is now
+ * detected rather than quietly mishandled. See CROSS-THREAD.md.
  *
  * Select with `--DRT-gcopt=gc:tgc`. Informal side-name: "realtime GC".
  *
@@ -598,6 +604,13 @@ private __gshared size_t segEmpty;    /// segments holding nothing
 private __gshared SpinLock segLock;
 private shared size_t committedBytes;
 
+/// Address range spanned by every segment, so `inTgcChunk` can reject a
+/// pointer that is nowhere near the heap without taking the lock. Widened
+/// only, never narrowed: a stale-wide range costs a lock acquisition, a
+/// stale-narrow one would miss a real foreign pointer.
+private shared size_t segLoAddr = size_t.max;
+private shared size_t segHiAddr;
+
 // -- platform mapping -------------------------------------------------------
 
 version (Posix)
@@ -862,6 +875,11 @@ private Segment* segCreate(size_t bytes, bool dedicated) nothrow @nogc
     }
 
     segTableInsert(s);
+    if (cast(size_t) s.base < atomicLoad(segLoAddr))
+        atomicStore(segLoAddr, cast(size_t) s.base);
+    immutable size_t end = cast(size_t) s.base + s.units * chunkSize;
+    if (end > atomicLoad(segHiAddr))
+        atomicStore(segHiAddr, end);
     segEmpty++;
     atomicOp!"+="(committedBytes, size);
     return s;
@@ -1017,6 +1035,44 @@ private void segReleaseEmpty() nothrow @nogc
         else
             segDropFree(segTable[i]);
     }
+}
+
+/**
+ * Is `p` inside a chunk this collector has handed out to *some* thread?
+ *
+ * Only ever used to turn a silent mistake into a loud one. tgc is strictly
+ * thread-private: a block belongs to the heap that allocated it, and no other
+ * thread's heap is ever searched, so a pointer from another thread simply does
+ * not resolve -- `GC.free` on it did nothing, `GC.sizeOf` returned zero, and
+ * the program carried on with a wrong answer. Now that chunks come from a
+ * global segment table, "not yours, but definitely ours" is a question that can
+ * be answered cheaply and without touching another heap's structures.
+ *
+ * Sound under the segment lock: `chunkFree` takes the same lock, so a unit
+ * marked in use cannot be released while this reads it.
+ */
+private bool inTgcChunk(void* p) nothrow @nogc
+{
+    // Almost every candidate is not tgc memory at all -- a stack address, a
+    // static buffer, a malloc block -- and answering those without the global
+    // lock is what keeps this affordable on a path the runtime takes often.
+    immutable size_t a = cast(size_t) p;
+    if (a < atomicLoad(segLoAddr) || a >= atomicLoad(segHiAddr))
+        return false;
+
+    segLock.lock(); tsanAcquire(cast(const(void)*) &segLock);
+    scope (exit)
+    {
+        tsanRelease(cast(const(void)*) &segLock);
+        segLock.unlock();
+    }
+
+    immutable size_t idx = segIndexOf(p);
+    if (idx >= segCount)
+        return false;
+    auto s = segTable[idx];
+    immutable size_t unit = (cast(ubyte*) p - cast(ubyte*) s.base) / chunkSize;
+    return testBit(s.inUse, unit);
 }
 
 private void chunkFree(void* p, size_t bytes) nothrow @nogc
@@ -2860,7 +2916,7 @@ class ThreadGC : GC
 
     uint setAttr(void* p, uint mask) nothrow
     {
-        auto b = queryBlock(p);
+        auto b = queryBlockToMutate(p);
         if (!b.valid())
             return 0;
         b.setAttr(b.attr() | mask);
@@ -2869,7 +2925,7 @@ class ThreadGC : GC
 
     uint clrAttr(void* p, uint mask) nothrow
     {
-        auto b = queryBlock(p);
+        auto b = queryBlockToMutate(p);
         if (!b.valid())
             return 0;
         b.setAttr(b.attr() & ~mask);
@@ -2906,7 +2962,7 @@ class ThreadGC : GC
             return null;
         }
 
-        auto b = queryBlock(p);
+        auto b = queryBlockToMutate(p);
         if (!b.valid())
         {
             // Unknown pointer — allocate fresh
@@ -2966,7 +3022,7 @@ class ThreadGC : GC
     {
         if (!p)
             return;
-        auto b = queryBlock(p);
+        auto b = queryBlockToMutate(p);
         if (!b.valid())
             return;
         auto owner = b.chunk.heap;
@@ -3182,7 +3238,7 @@ class ThreadGC : GC
     bool expandArrayUsed(void[] slice, size_t newUsed, bool atomic = false) nothrow @safe
     {
         return (() @trusted {
-            auto b = queryBlock(slice.ptr);
+            auto b = queryBlockToMutate(slice.ptr);
             if (!b.valid())
                 return false;
             auto m = b.meta();
@@ -3225,7 +3281,7 @@ class ThreadGC : GC
 
     bool shrinkArrayUsed(void[] slice, size_t existingUsed, bool atomic = false) nothrow
     {
-        auto b = queryBlock(slice.ptr);
+        auto b = queryBlockToMutate(slice.ptr);
         if (!b.valid())
             return false;
         auto m = b.meta();
@@ -3282,6 +3338,29 @@ private:
     static bool inSegment(const scope void[] segment, void* p) nothrow @nogc
     {
         return p >= segment.ptr && p < segment.ptr + segment.length;
+    }
+
+    /**
+     * Resolve a pointer this thread is about to *act on*.
+     *
+     * Separate from the read-only form because the answer to "I know nothing
+     * about this pointer" differs by intent. For a query -- `sizeOf`, `addrOf`,
+     * `query` -- "no block" is a legitimate answer that callers ask for
+     * speculatively, and the collector must stay silent. For an operation that
+     * changes a block, a pointer belonging to another thread is a bug in the
+     * caller that used to do nothing at all, quietly.
+     */
+    BlkRef queryBlockToMutate(void* p) nothrow @nogc
+    {
+        auto b = queryBlock(p);
+        if (!b.valid())
+            assert(!inTgcChunk(p),
+                "tgc: this pointer belongs to another thread's heap. tgc heaps " ~
+                "are thread-private: a block is owned by the thread that " ~
+                "allocated it, and only that thread may free, resize or " ~
+                "re-attribute it. Transfer ownership by copying, or by " ~
+                "`immutable`, rather than by pointer.");
+        return b;
     }
 
     BlkRef queryBlock(void* p) nothrow @nogc

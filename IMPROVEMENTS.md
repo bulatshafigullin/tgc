@@ -41,68 +41,67 @@ Quadratic → linear. Appending 100,000 elements: 100,000 reallocations → 13.
 
 ---
 
-## Open — design decision required
+## Decided — heaps are strictly thread-private
 
-### 1. Cross-thread ownership transfer is unsound, and unenforced
+### 1. Cross-thread ownership transfer: removed rather than made safe
 
-> Researched in depth in [CROSS-THREAD.md](CROSS-THREAD.md), which supersedes
-> the options sketched below. Headline: the problem is worse than "users must
-> not share" — `Thread`'s closure, the `Thread` object and `join()`'s exception
-> propagation all cross heaps by construction. D's type system cannot fix this
-> at allocation time (the spec blesses `cast(shared)` on thread-local data), but
-> collection-time escape detection can.
+> Researched in depth in [CROSS-THREAD.md](CROSS-THREAD.md). Headline: the
+> problem is worse than "users must not share" — `Thread`'s closure, the
+> `Thread` object and `join()`'s exception propagation all cross heaps by
+> construction. D's type system cannot fix this at allocation time (the spec
+> blesses `cast(shared)` on thread-local data), but collection-time escape
+> detection can.
 >
-> **Phases 0 and 1 are done**: a dying thread's arenas are retained rather than
-> finalized and freed (closing the `join()` use-after-free), and blocks observed
-> reachable from a global root are stickily promoted and never reclaimed by a
-> thread-local sweep.
+> **Phases 0, 1 and 2 are done**: a dying thread's arenas are retained rather
+> than finalized and freed (closing the `join()` use-after-free); blocks
+> observed reachable from a global root can be stickily promoted
+> (`tgcTrackEscapes`, opt-in); and `tgcCollectGlobal()` reclaims adopted arenas
+> and demotes promoted blocks, with a measured 0.07 ms world-stop for marking
+> only.
 >
-> **Phase 2 is done**: `tgcCollectGlobal()` reclaims adopted arenas and demotes
-> promoted blocks, with a measured 0.07 ms world-stop for marking only. That
-> removes the permanent-retention objection to both Phase 0 and Phase 1.
->
-> Phase 1 still ships **off by default** (`tgcTrackEscapes(true)` enables it),
-> because the promoted set is sticky and must be re-scanned every cycle:
-> measured, the mark phase grew from 0.25 ms to 3.66 ms as the promoted set
-> grew to 212,000 blocks, and it keeps growing. Unbounded pause growth is a
-> worse failure than the bug it fixes for this collector's audience.
->
-> Two things remain. Promotion is *sampled* at collection time, so a block
-> published, shared and unpublished entirely between two collections is never
-> seen and is still vulnerable; closing that needs a write barrier D does not
-> have. And promoted blocks accumulate, because only a cooperative global
-> collection (Phase 2) can prove no thread holds them — which is also what
-> would let Phase 1 be the default.
+> Phase 1 still ships **off by default**, because the promoted set is sticky and
+> re-scanned every cycle: measured, the mark phase grew from 0.25 ms to 3.66 ms
+> as the promoted set reached 212,000 blocks. Promotion is also *sampled* at
+> collection time, so a block published, shared and unpublished entirely between
+> two collections is never seen; closing that needs a write barrier D does not
+> have.
 
-This is the one item from the audit deliberately **not** fixed, because it is a
-design decision rather than a bug fix.
+**This is now decided.** The documented "explicit ownership transfer" path is
+gone. It could not be made sound without scanning the receiving thread's stack,
+which is the one thing this collector does not do, and it was the worst of the
+available options: an unsafe path, documented as unsupported, left reachable and
+untested.
 
-The docs say transfer is the single supported cross-thread path. The
-implementation cannot make it safe:
+Two of the three hazards the audit listed had already been fixed and the entry
+had gone stale — worth recording, because the shape of the remaining one is
+different:
 
-- A block handed to thread B is still owned by A's heap. A's collector scans
-  only A's stack, registers, TLS and the global roots. B's stack is never
-  scanned, so **A's next collection sweeps the block while B is using it.**
-- `queryBlock`'s foreign-heap fallback reads other heaps' chunk maps under
-  `heapsLock` only, while the owning thread mutates them under no lock at all.
-- `free()` on a foreign block queues the pointer for the owner, but the owner
-  may already have swept it, so `drainRemote` can double-free.
+* `queryBlock`'s foreign-heap fallback no longer probes other live heaps; it
+  searches only the orphan heap, under `orphanLock` (item 11).
+* The remote-free queue and `drainRemote` no longer exist. `free()` resolves
+  only this thread's heap or the orphan heap.
+* What was left was the *silence*: a foreign pointer was indistinguishable from
+  a non-GC pointer, so `GC.free` on another thread's block did nothing and the
+  caller never found out.
 
-Nothing enforces the "don't share" rule and no test exercises it, so the hazard
-stays invisible until it corrupts a user's heap.
+That silence is what changed. Chunks now come from a global segment table
+(item -3), which makes "tgc memory, but not yours" a question that can be
+answered cheaply and without touching another heap's structures — two atomic
+loads for the common case, a lock and a binary search only for a pointer that
+really does land in the heap. The mutating entry points — `free`, `realloc`,
+`setAttr`, `clrAttr`, `expandArrayUsed`, `shrinkArrayUsed` — assert on a foreign
+block. Read-only queries stay silent and answer "no block", because callers ask
+those speculatively and druntime itself does.
 
-**Options:**
+`test/tgc_shared.d` covers it, with the owning thread deliberately kept alive:
+once it exits its arenas move to the orphan heap, where any thread may
+legitimately answer for them.
 
-- *Explicit pinned transfer (recommended).* Add `tgcTransfer(p)` moving the
-  block out of A's heap into a global in-flight set that no collector sweeps,
-  and `tgcAdopt(p)` linking it into B. Everything else stays strictly
-  thread-private, and `free`/`realloc`/`query` on a foreign pointer becomes an
-  assert instead of a silent race.
-- *Remove the path.* Drop the remote-free queue and the foreign-heap fallback
-  entirely and document tgc as strictly thread-private.
-
-The current middle ground — an unsafe path documented as unsupported but left
-reachable and untested — is the worst of the three.
+**What remains open**, and it is smaller than the entry it replaces: the checks
+are asserts, so a `-release` build is back to the old silent behaviour. That is
+the right trade for a hot path, but it means the enforcement is a development
+aid rather than a guarantee. A build-time switch to keep them in release would
+be cheap to add if anyone wants it.
 
 ---
 

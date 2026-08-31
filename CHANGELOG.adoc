@@ -47,6 +47,29 @@ use those objects. See `CROSS-THREAD.md`.
 * `removeRoot`/`removeRange` no longer `assert(false)` — that halted the
   process in release builds when removing an unknown root.
 * `runFinalizers(segment)` is implemented instead of being a no-op.
+* *Handing a GC block to another thread is now detected instead of silently
+  mishandled.* tgc heaps are strictly thread-private, and the "explicit
+  ownership transfer" path the docs advertised is gone -- it could not be made
+  sound without scanning the receiving thread's stack, which is the one thing
+  this collector does not do. Most of that path had already been removed
+  piecemeal (the remote-free queue, the foreign-heap probe); what was left was
+  the silence. A pointer from another thread was indistinguishable from a
+  non-GC pointer, so `GC.free` on another thread's block did nothing and the
+  caller never found out.
++
+The segment table makes "tgc memory, but not yours" cheap to answer without
+touching another heap's structures: two atomic loads against the segment address
+range for the common case, a lock and a binary search only for a pointer that
+really does land in the heap. `free`, `realloc`, `setAttr`, `clrAttr`,
+`expandArrayUsed` and `shrinkArrayUsed` assert on a foreign block. Read-only
+queries -- `sizeOf`, `addrOf`, `query`, `getAttr` -- stay silent and answer "no
+block", because callers ask those speculatively and druntime itself does.
++
+These are asserts, so a `-release` build keeps the old silent behaviour and pays
+nothing. `test/tgc_shared.d` covers it, keeping the owning thread alive for the
+duration: once it exits, its arenas move to the orphan heap and any thread may
+legitimately answer for them.
+
 * *A region is unlinked from its heap before it is verified, not after.* The
   verifier reports by asserting, and a region still linked when that assert
   unwound stayed current for the fiber -- so every later allocation on the

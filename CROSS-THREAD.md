@@ -1,5 +1,21 @@
 # Can D's type system make per-thread heaps sound?
 
+> **Decision (this note's outcome).** The "explicit ownership transfer" path is
+> **removed**. tgc heaps are strictly thread-private: a block belongs to the
+> thread that allocated it, only that thread may free, resize or re-attribute
+> it, and no collection searches another heap. Handing a block to another
+> thread is now *detected* -- the mutating entry points assert -- rather than
+> silently doing nothing, which is what they did before. The opt-in mitigation
+> for the publish-to-a-global pattern (`tgcTrackEscapes`) stays as it is, and
+> the analysis below is what led here: transfer could not be made sound without
+> scanning the receiving thread's stack, which is the one thing this collector
+> does not do.
+>
+> The alternative considered and rejected was a pinned-transfer API
+> (`tgcTransfer`/`tgcAdopt`) moving blocks into a global in-flight set no
+> collector sweeps. It is implementable, but it adds a second ownership model
+> to a collector whose entire argument is that there is only one.
+
 Research note for `tgc`. Every claim marked **[measured]** was produced by
 compiling and running a probe against this repository's collector with
 LDC 1.42.0 (DMD 2.112.1) on macOS/aarch64. Probes are in the session scratchpad.

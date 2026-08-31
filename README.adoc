@@ -31,7 +31,7 @@ extern(C) __gshared rt_options = ["gcopt=gc:tgc"];
 == Requirements
 
 * DMD 2.112+ or LDC with pluggable GC + `registerGCFactory` thread init hook (same era as SymGC integration).
-* Prefer message passing / ownership transfer across threads; unrestricted shared mutable GC pointers are unsupported in v1.
+* Pass data across threads by copying or by `immutable`; heaps are strictly thread-private, and a GC block belongs to the thread that allocated it.
 
 == Design
 
@@ -49,10 +49,16 @@ the root tables are snapshotted rather than held locked for the duration.
 
 === Limitations
 
-* *Cross-thread sharing is unsupported in v1.* A block handed to another thread
-  is still owned by the allocating thread's heap, and that heap's collector
-  never scans the other thread's stack, so the block can be swept while still in
-  use. Prefer `immutable` or copied message passing.
+* *Heaps are strictly thread-private.* A block handed to another thread is
+  still owned by the allocating thread's heap, and that heap's collector never
+  scans the other thread's stack, so the block can be swept while still in use.
+  Pass ownership by copying or by `immutable`, not by pointer.
++
+Misuse is now detected rather than silent: `GC.free`, `realloc`, `setAttr` and
+the array-mutating calls assert when handed a block belonging to another
+thread's heap. Read-only queries such as `GC.sizeOf` stay quiet and answer
+"no block", because callers ask those speculatively. The checks are asserts, so
+they cost nothing in a `-release` build.
 +
 `tgcTrackEscapes(true)` opts into retaining anything seen reachable from a
 global, which covers the common publish-to-a-global handoff. It is off by

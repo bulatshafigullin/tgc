@@ -301,3 +301,57 @@ unittest
     assert(after < baseline + (peak - baseline) / 2,
         "escape tracking retained purely thread-local garbage");
 }
+
+// ---------------------------------------------------------------------------
+// thread-private is now enforced, not just documented
+// ---------------------------------------------------------------------------
+
+__gshared void* foreignBlock;
+shared bool foreignReady;
+shared bool foreignRelease;
+
+unittest
+{
+    // A block belongs to the thread that allocated it. Another thread cannot
+    // free, resize or re-attribute it -- and until chunks came from a global
+    // segment table there was no cheap way to tell "another thread's block"
+    // from "not a GC pointer", so the operation did nothing and the caller
+    // never found out. It now asserts.
+    //
+    // The owning thread is kept alive for the duration: once it exits, its
+    // arenas move to the orphan heap, and a block there is legitimately
+    // answerable by anyone.
+    auto owner = new Thread({
+        auto b = new ubyte[512];
+        b[0] = 0x7E;
+        foreignBlock = b.ptr;
+        atomicStore(foreignReady, true);
+        while (!atomicLoad(foreignRelease))
+            Thread.yield();
+        keepAlive(b.ptr);
+    });
+    owner.start();
+
+    while (!atomicLoad(foreignReady))
+        Thread.yield();
+
+    bool caught = false;
+    try
+        GC.free(foreignBlock);
+    catch (Throwable)
+        caught = true;
+
+    // A read-only query stays silent, deliberately: "no block" is a legitimate
+    // answer that callers ask for speculatively, and druntime does.
+    immutable size = GC.sizeOf(foreignBlock);
+
+    atomicStore(foreignRelease, true);
+    owner.join();
+
+    assert(caught,
+        "freeing another thread's block was accepted silently; tgc heaps are " ~
+        "thread-private and that has to be enforced, not just documented");
+    assert(size == 0, "a foreign block should resolve to nothing, not to a size");
+
+    foreignBlock = null;
+}
