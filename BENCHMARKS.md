@@ -447,11 +447,47 @@ Reverted. The premise was right about the attribute array being 21 lines per
 `attrs` costs one line per 64 slots while the `SlotMeta` side array costs one per
 four.
 
+### Rejected: splitting `SlotMeta`, and prefetching
+
+Two more mark-phase ideas, measured the same way and reverted for the same
+reason.
+
+`SlotMeta` is `{TypeInfo ti; size_t usedSize}`, 16 bytes per slot, and nothing
+reads both fields -- marking reads the type, the array API reads the length. As
+two arrays, marking touches a cache line every eight slots instead of every
+four, and allocation gets *cheaper* rather than dearer, because every read of
+the length is already gated on `APPENDABLE` and a block without it can leave the
+entry stale.
+
+| `bintree 18`, ten paired runs | total pause |
+|---|---|
+| one 16-byte struct | mean 554 ms |
+| two arrays | mean 563 ms |
+
+1.7% slower, losing eight of ten pairs, and identical on the pure-mark probe at
+256,000 live objects.
+
+Prefetching the directory entry for the pointer eight words ahead of the one
+being marked, in both range scans:
+
+| `bintree 18`, five paired runs | total pause |
+|---|---|
+| no prefetch | mean 547 ms |
+| prefetch | mean 562 ms |
+
+2.8% slower, losing all five. Stripping the range and block checks down to a
+shift, a mask and the instruction -- a prefetch of a nonsense address is
+architecturally a no-op, so they are not needed -- was worse again, with one
+680 ms outlier against a 545 ms norm that looks like page walks for garbage
+addresses.
+
 ## What is left
 
 Marking is still the top cost, and it is now most of what the collector does:
 the sweep is off the profile and the allocator is no longer faulting pages in a
 loop. What remains is the conservative scan itself and the cache misses
 inherent in chasing pointers through a heap. See `IMPROVEMENTS.md` for the
-explanations already tested and rejected -- four before these passes, eight now,
-of which two paid.
+explanations already tested and rejected -- four before these passes, ten now,
+of which two paid. Three of the four tried in the latest pass were negative on
+arm64, which is itself a result: the mark phase here is not bound by cache lines
+per marked object in the way the counters suggested.

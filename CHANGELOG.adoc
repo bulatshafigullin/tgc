@@ -624,6 +624,13 @@ commit.
 * CI builds `--build=release --d-version=TgcEnforce`, the one configuration
   where the ownership check cannot fall back on the assertion machinery.
 
+* Two more mark-phase experiments measured and *not* taken, recorded in
+  `IMPROVEMENTS.md` and `BENCHMARKS.md` so they are not tried a third time:
+  splitting `SlotMeta` into separate `TypeInfo` and length arrays, which halves
+  what marking touches and still measured 1.7% slower over ten paired runs; and
+  prefetching the chunk-directory entry for the pointer eight words ahead of the
+  one being marked, which measured 2.8% slower over five. Three of the four
+  ideas in the mark-phase list have now been tried and only interleaving paid.
 * `bench/webserver_probe.d` gained `noScanSweep`: collection time against a live
   set of buffers rather than of objects, which is the bulk of what a server
   actually holds and the opposite extreme from the existing sweep. It was added

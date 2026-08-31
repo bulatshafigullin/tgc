@@ -138,16 +138,38 @@ conservative scanning and the cache lines each marked object touches.
    every allocation and a second place for the truth to live. If this is
    revisited it should be `SlotMeta` that moves, not `attrs` — which is item 4
    below.
-7. **Prefetch down the mark stack.** Standard for a pointer-chasing collector,
-   untried here.
+7. ~~**Prefetch down the mark stack.**~~ ❌ Measured and reverted. Resolving a
+   candidate is a chain of four dependent misses — directory entry, chunk
+   header, state group, `TypeInfo` — and only the first can be started early
+   without having done the lookup, so the experiment prefetched the directory
+   entry for the pointer eight words ahead of the one being marked, in both the
+   conservative and precise range scans. **2.8% slower**, losing all five paired
+   runs. Stripping the range and block checks down to a shift, a mask and the
+   instruction itself — a prefetch of a nonsense address is architecturally a
+   no-op, so the checks are not needed — made it *worse* again, and produced one
+   680 ms outlier against a 545 ms norm, which looks like prefetching garbage
+   addresses costing page walks.
+   M-series hardware already runs ahead of a sequential range scan; what is left
+   after that is the pointer-chase, and a prefetch issued from the scan cannot
+   see far enough down it to help.
 8. **Re-test multiply-by-reciprocal on x86-64.** It measured *slower* on arm64
    and was reverted; the 32-bit divide that replaced it is cheap there but
-   x86-64's divider is not, and that half was never measured.
+   x86-64's divider is not, and that half was never measured. Untested here for
+   the same reason: there is no x86-64 machine in this loop.
 
-Expect single-digit percentages each; item 5 delivered 2.5% and item 6 nothing,
-which is the usual hit rate for this list. What is left in it — 7 and 8 — is
-"untried" and "untried on the platform that would show it", not "has a
-mechanism".
+Of the four ideas in this section, one paid. That is worth stating plainly
+because the list reads like four opportunities and is not: interleaving was
+worth 2.5%, and `NO_SCAN` bits, splitting `SlotMeta` and prefetching were each
+measured on the workload they were supposed to help and were each *negative* on
+arm64. The mark phase here is not bound by cache lines per marked object in the
+way the counters suggested — tgc already misses cache less than druntime's
+collector on the same live set, and these three were all attempts to miss even
+less.
+
+What that leaves is item 8, which needs hardware not in this loop, and the
+observation that the next honest step is not another micro-optimization but a
+regression gate: two of the three rejections above were *plausible*, and nothing
+in CI would have caught them. That is item 11.
 
 Nothing here blocks tagging 0.2.0. Section C needs help from outside the
 repository.
@@ -364,6 +386,8 @@ is close. Six cheap explanations have now been tested:
 | per-chunk uniform `TypeInfo`, to skip a cold load | 3.6% upper bound, not taken |
 | interleaving the state bitvectors per 64-slot group | 2.5%, shipped |
 | `NO_SCAN` mirrored into those groups | *negative* on bintree, a wash elsewhere |
+| splitting `SlotMeta` into `ti[]` and `usedSize[]` | *negative*, 1.7% over ten pairs |
+| prefetching the directory entry down the scan | *negative*, 2.8% |
 
 What *did* pay was replacing the hash map with an address-indexed directory
 (shipped) — a candidate outside the heap's span is now rejected in two compares
@@ -401,17 +425,30 @@ affinity itself, which needs a hook druntime does not expose today; the
 fallback is a tgc-side registry updated when a fiber is first seen running on a
 thread.
 
-### 4. Per-slot metadata is down to 17.375 bytes; `ti` and `usedSize` remain
+### 4. Per-slot metadata is down to 17.375 bytes; splitting the last two did not pay
 
 Slot state moved into per-chunk bitvectors and attributes into a byte array, so
 `SlotMeta` is now just `TypeInfo ti` and `size_t usedSize` — 24 bytes per slot
 to 17.375, measured as 48.50 to 41.94 bytes of arena per 16-byte object.
 
-The remaining two fields are each needed only sometimes: `ti` only for
-finalizable blocks, `usedSize` only for appendable ones. Moving them to side
-tables keyed by slot would take a 16-byte object's overhead down further, at the
-cost of a lookup on the array-append path — which is hot, so this needs
-measuring before it is worth doing.
+The remaining two fields are each needed only sometimes: `ti` for finalizable
+and precisely-scanned blocks, `usedSize` only for appendable ones. Nothing reads
+both — marking reads the type and never the length, the array API reads the
+length and never the type — so splitting the struct into two arrays halves what
+marking touches: a line every eight slots instead of every four.
+
+That was measured and it does not pay. Ten paired runs on binary-trees, **1.7%
+slower**, losing eight of ten; the pure-mark probe at 256,000 live objects was
+identical to two decimal places. Split arrays also make the allocation path
+*cheaper* rather than dearer, which is the unusual part — every read of the
+length is already gated on `APPENDABLE`, so a block without it can leave the
+entry stale instead of storing a zero — and that was not enough either. Reverted.
+
+The likely reason is that a pointer-chasing mark visits a chunk's slots in
+effectively random order, so halving the array stride only helps when two
+marked objects share a line, which at 8 slots per line against 4 is a small
+fraction of visits. It would look different for a dense sweep over `ti`, and
+there is no such pass.
 
 ### 4b. Fiber enumeration is still O(all fibers in the program)
 
