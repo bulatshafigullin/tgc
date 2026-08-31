@@ -384,6 +384,23 @@ floor the automatic path keeps.
 sits in every chunk. Nothing is returned, and nothing should be: the chunks are
 genuinely in use. That is fragmentation, not retention.
 
+On Linux/x86-64 the same probe needs no ledger to show it, because
+`MADV_DONTNEED` moves RSS directly. Debian 13, LDC 1.42.0, THP `always`:
+
+| after the drop | committed | RSS |
+|---|---|---|
+| at peak | 128.0 MB | 112.8 MB |
+| `--ratio=0`, any number of collections | 128.0 MB | 112.9 MB |
+| default, 1st collection | 128.0 MB | 112.8 MB |
+| default, 2nd collection | 24.0 MB | 26.8 MB |
+| then `GC.minimize()` | 24.0 MB | 26.8 MB |
+
+`GC.minimize()` finds nothing more to give back there, unlike on macOS, because
+`MADV_DONTNEED` drops the pages outright where `MADV_FREE_REUSABLE` leaves them
+resident until the system wants them. That box carries an unrelated production
+load, so the pause column from it is not reported; what is being checked is
+whether the memory comes back, and it does.
+
 Cost, on the benchmarks above rather than on the probe — the probe's own pause
 column is noise once collections are seconds apart:
 

@@ -106,11 +106,17 @@ the escape the verifier exists to catch. The verifier was right both times.
   `MADV_FREE` moved neither footprint nor RSS.
 * *The collector is torn down at exit.* `ThreadGC` had an empty destructor, so
   every heap ever created -- its chunk directory, mark stack and root snapshot
-  buffers -- plus every segment under them outlived the process. Harmless, since
-  the OS reclaims it, but indistinguishable to LeakSanitizer from a real leak,
-  which is why the ASan job ran with `detect_leaks=0`. `~ThreadGC` now frees the
-  heaps and unmaps the segments, as druntime's own collector does, and the flag
-  is off.
+  buffers -- plus every segment under them outlived the process. `~ThreadGC` now
+  frees the heaps and unmaps the segments, as druntime's own collector does.
++
+This does *not* let the ASan job's `detect_leaks=0` come off, and the entry in
+`IMPROVEMENTS.md` that said it would was wrong about what leaked. Run under
+LeakSanitizer on Linux/x86-64 the report is 2112 bytes in two allocations, all
+of it in druntime's `core.runtime.defaultTraceHandler` -- the backtrace attached
+to a `Throwable` a test catches and drops, freed by that object's destructor and
+therefore never freed, since nothing finalizes the heap at exit. The commit
+before this work reports it byte for byte. The heaps were reachable from the
+heap registry the whole time, which is why LeakSanitizer never named them.
 
 === Changed — performance
 
@@ -624,6 +630,13 @@ commit.
 * CI builds `--build=release --d-version=TgcEnforce`, the one configuration
   where the ownership check cannot fall back on the assertion machinery.
 
+* Everything here verified on Linux/x86-64 as well as macOS/arm64: the full
+  suite under LDC 1.42.0 and DMD 2.113.0, in both the ordinary and the optimized
+  build; ThreadSanitizer clean; AddressSanitizer clean; and the release
+  `TgcEnforce` build under both compilers. The Linux run also exercises what
+  macOS cannot -- `MADV_HUGEPAGE` and `MADV_DONTNEED` -- and confirms the
+  automatic trim there directly in RSS: 112.8 MB to 26.8 MB one collection after
+  the drop, against staying at 112.8 MB with it disabled.
 * Two more mark-phase experiments measured and *not* taken, recorded in
   `IMPROVEMENTS.md` and `BENCHMARKS.md` so they are not tried a third time:
   splitting `SlotMeta` into separate `TypeInfo` and length arrays, which halves

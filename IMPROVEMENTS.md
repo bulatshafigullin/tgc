@@ -91,12 +91,25 @@ All four are in. What they cost and what had to be learned:
    class — the caller said how much it needs, not what shape it will be in.
    Reserving 256 MB costs 16 ms and takes 6 ms off the allocation phase that
    follows.
-4. **Shutdown leak.** ✅ `~ThreadGC` frees every heap still registered and
-   unmaps the segments, as druntime's own collector does. The ASan job now runs
-   with `detect_leaks=1`.
+4. **Shutdown leak.** ✅ as a fix, ❌ as a diagnosis. `~ThreadGC` frees every
+   heap still registered and unmaps the segments, as druntime's own collector
+   does, and that is worth having. But it does *not* let `detect_leaks` come
+   off, because the leak this item described was never tgc's.
 
-   Not verified locally: ASan still cannot run on macOS/arm64 — the test binary
-   builds and then hangs — so CI is the first execution of the leak check.
+   Run under LeakSanitizer on Linux/x86-64, the report is 2112 bytes in two
+   allocations, all of it inside druntime's `core.runtime.defaultTraceHandler`
+   — the backtrace attached to a `Throwable` that a test catches and drops.
+   That memory is freed by the `Throwable`'s destructor, so it is never freed at
+   all: nothing finalizes the heap at exit. The same build against the commit
+   before this work reports it byte for byte, which settles the attribution.
+
+   So the entry's "a heap's root/range snapshot buffer never freed at shutdown"
+   was wrong, and it was wrong in the direction that flatters us — those buffers
+   were reachable from the heap registry the whole time, which is exactly why
+   LeakSanitizer never named them. `detect_leaks` stays at 0; turning it on
+   needs a suppression for that druntime function, the same treatment
+   `.tsan-suppressions` gives `thread_suspendHandler`, plus a symbolizer in the
+   runner for the suppression to match against.
 
 While fixing item 1, the oversized-allocation test in `test/tgc_safety.d` turned
 out to be passing on unrelated slack: an unoptimized build keeps a slice's stack
@@ -536,12 +549,13 @@ That is also why the sampled-promotion hole in `CROSS-THREAD.md` cannot be
 closed. What tgc gets in exchange is that a thread-local collection has no
 concurrent mutator at all, so it needs no barrier for the common case.
 
-### 9. `ThreadGC` is never destroyed — done
+### 9. `ThreadGC` is never destroyed — done, but it was not the leak
 
 `~ThreadGC` frees every heap still registered — the thread that reaches
 `gc_term` is still running, so its heap had never been torn down — and unmaps
 the segments under them, which is what druntime's own collector does from its
-destructor for the same reason.
+destructor for the same reason. That is correct and worth having on its own
+terms; it is not what LeakSanitizer was reporting. See item A4.
 
 The instance itself is still not freed, deliberately: `destroy` writes the class
 initialiser back over that memory as soon as the destructor returns, so freeing
@@ -586,11 +600,16 @@ Fixed by deleting it -- `sweepOrphanHeap` already publishes the value atomically
 under the lock. It reproduces intermittently, which is the usual shape and the
 reason a sanitizer run is worth repeating rather than doing once.
 
-AddressSanitizer reports zero errors. `detect_leaks` is now **on**: the leak it
-used to report was the collector never being torn down (item 9), which is fixed,
-so the flag is a check rather than a nuisance. That has not been run locally --
-ASan still cannot execute on macOS/arm64, where the test binary builds and then
-hangs -- so CI is the first execution of it. Two reclamation assertions are skipped
+AddressSanitizer reports zero errors, and `detect_leaks` stays **off**. With it
+on, LeakSanitizer reports 2112 bytes in two allocations, every byte of it inside
+druntime's `core.runtime.defaultTraceHandler` -- the backtrace attached to a
+`Throwable` a test catches and drops, freed by that object's destructor and so
+never freed, because nothing finalizes the heap at exit. The commit before the
+teardown work reports it identically, so it is neither new nor tgc's. Turning
+the flag on needs an LSan suppression for that function and a symbolizer in the
+runner to match it against; both are small and neither has been done.
+
+This is also the correction to what item 9 used to claim. Two reclamation assertions are skipped
 under `TgcSanitize`: ASan's redzones and quarantine change the stack layout
 enough that a conservative collector never lets the objects go. Reclamation is
 covered by the ordinary builds; the sanitizer run is checking safety.
