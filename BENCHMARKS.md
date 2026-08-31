@@ -8,6 +8,11 @@ bench/run.sh -d 16 -r 1     # quicker
 bench/run.sh -b bintree     # one variant
 ```
 
+Two probes sit outside the driver, because what they measure is not wall time:
+`bench/webserver_probe.d` (`--config=bench-webserver`) for collection time
+against live set and against suspended fibers, and `bench/trim_probe.d`
+(`--config=bench-trim`) for whether a shrunken heap gives its memory back.
+
 Each variant is a dub configuration (`bench-bintree`, `bench-mt`,
 `bench-region`) that links tgc in, so the collector is chosen at runtime with
 `--DRT-gcopt=gc:` and both columns of a comparison run the same binary. The
@@ -348,6 +353,62 @@ hardest: every region close frees a whole set of them at once.
 macOS/arm64 is unchanged in either direction -- 1.42 s and 550 ms of pause on
 `bintree 18` before and after -- which is the expected answer where there are no
 transparent huge pages to get.
+
+## Returning memory — macOS/arm64
+
+`bench/trim_probe.d` (`dub build --config=bench-trim`, then
+`./bench-trim --DRT-gcopt=gc:tgc`). Two million 32-byte objects, 95% of them
+dropped, then collections spaced out past the trim's window. `--ratio=0` is the
+old behaviour: memory came back only from `GC.minimize()`.
+
+Apple M-series, LDC 1.42.0, `-O2 -release`. *Footprint* is the kernel's ledger,
+which is what Activity Monitor shows and what memory limits are enforced
+against; RSS is reported too because it is the number people reach for first and
+on macOS it is the wrong one — `MADV_FREE_REUSABLE` leaves pages resident until
+the system wants them, so only munmap moves RSS.
+
+| after the drop | committed | RSS | footprint |
+|---|---|---|---|
+| at peak | 128.0 MB | 111.9 MB | 110.9 MB |
+| `--ratio=0`, any number of collections | 128.0 MB | 111.9 MB | 110.9 MB |
+| default, 1st collection | 128.0 MB | 111.9 MB | 110.9 MB |
+| default, 2nd collection | 22.0 MB | 66.2 MB | 23.2 MB |
+| then `GC.minimize()` | 22.0 MB | 34.2 MB | 23.2 MB |
+
+The first collection returning nothing is the hysteresis working: the window in
+which the peak was still standing had not closed yet. `GC.minimize()` still
+finds 32 MB of RSS to unmap afterwards, because it ignores the one-segment
+floor the automatic path keeps.
+
+`--scatter` keeps every twentieth object instead of the first 5%, so a survivor
+sits in every chunk. Nothing is returned, and nothing should be: the chunks are
+genuinely in use. That is fragmentation, not retention.
+
+Cost, on the benchmarks above rather than on the probe — the probe's own pause
+column is noise once collections are seconds apart:
+
+| | total pause, before | after |
+|---|---|---|
+| `bintree 18` | 558 ms | 543 ms |
+| `bintree_mt 18 4` (parallel section) | 51–60 ms | 44–47 ms |
+| `bintree_region 18 4` | 18.6 ms | 18.6 ms |
+| `bench-webserver`, 256k live | 1.15 ms | 1.16 ms |
+
+Two earlier formulations of the trigger did cost time, and are recorded in
+`segTrim` and `IMPROVEMENTS.md` because the failure is not obvious: judging on
+what the heap holds at the end of a collection reads it at its trough and cost
+7% of pause on `bintree`, and judging on the peak since the last collection cost
+2.8x on `bintree_mt 18 4`, because every thread's collection resets the window.
+
+### `GC.reserve`
+
+| | build the 128 MB peak |
+|---|---|
+| no reserve | 35 ms |
+| after `GC.reserve(256 MB)` | 29 ms |
+
+The reservation itself costs 16 ms and touches all 256 MB, which is more than
+this workload goes on to use. It is a latency trade, not a throughput one.
 
 ## What is left
 

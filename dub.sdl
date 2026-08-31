@@ -85,3 +85,12 @@ configuration "bench-webserver" {
     sourceFiles "bench/webserver_probe.d"
     mainSourceFile "bench/webserver_probe.d"
 }
+
+// Does a shrunken heap give its memory back, and what does GC.reserve buy?
+configuration "bench-trim" {
+    targetType "executable"
+    targetName "bench-trim"
+    sourcePaths "source"
+    sourceFiles "bench/trim_probe.d"
+    mainSourceFile "bench/trim_probe.d"
+}

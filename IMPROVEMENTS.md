@@ -15,17 +15,19 @@ scanning**, 16-byte payload alignment, one-past-the-end marking,
 `disable()`/`collect()` semantics, **thread-teardown use-after-free (Phase 0 of
 the cross-thread fix)**, `TypeInfo` capture for struct finalizers, `realloc`
 accounting, atomics on cross-thread state, unattached-thread collection refusal,
-`runFinalizers`.
+`runFinalizers`, **collector teardown at exit**.
 
 Performance: chunk-arena allocator with O(1) pointer resolution, explicit mark
 worklist, array API implementation, threshold decay, chunk release, root
 snapshotting, pause-time instrumentation, **word-at-a-time sweeping**,
 **address-indexed chunk directory**, **segment-backed chunks (huge pages)**,
-size-class table, pointer-map memo.
+size-class table, pointer-map memo, **automatic return of committed memory**,
+**`reserve()`**.
 
 Infrastructure: UTF-8 conversion, `.gitattributes`, CI (DMD/LDC ×
-Linux/macOS/Windows + sanitizers + encoding guard), adversarial test suite,
-optimized test build, **in-repo benchmarks** (`bench/run.sh`).
+Linux/macOS/Windows + sanitizers + encoding guard + a `TgcEnforce` build),
+adversarial test suite, optimized test build, **in-repo benchmarks**
+(`bench/run.sh`, `bench/trim_probe.d`).
 
 Measured collection time, N live 32-byte objects, macOS/arm64. The last column
 is the current collector, reproducible with `bench/webserver_probe.d`; the first
@@ -51,27 +53,57 @@ below is measurable with what is now in the repository (`bench/run.sh`,
 `bench/webserver_probe.d`), which is the standard the last two passes were held
 to and the reason two of their four "obvious" optimizations were reverted.
 
-### A. Before calling it 0.2.0
+### A. Before calling it 0.2.0 — done
 
-1. **Return memory without being asked.** The segment allocator only gives
-   memory back on `GC.minimize()`, so a server that never calls it holds its
-   peak for the life of the process. That is a surprising default and the most
-   likely thing to be reported as a leak. Proposal: during a collection, when a
-   segment falls below some occupancy, hand back its free 2 MB spans — the
-   machinery already exists, only the trigger is missing. Needs hysteresis so a
-   breathing heap does not thrash, and measuring on both RSS and pause.
-2. **Keep the thread-private checks in release builds, optionally.** They are
-   asserts, so `-release` is back to the old silent behaviour. A
-   `version(TgcEnforce)` that keeps them costs two atomic loads on a cold path
-   and turns a development aid into a guarantee for anyone who wants it.
-3. **`reserve()` still returns 0.** Trivial now that chunks come from segments:
-   pre-map and pre-touch, so a latency-sensitive caller pays the page faults up
-   front instead of inside its first request. Small, and directly useful to the
-   audience this collector is for.
-4. **Shutdown leak.** `ThreadGC` is `malloc`'d and never destroyed, and a heap's
-   root/range snapshot buffers leak with it — LeakSanitizer reports 1056 bytes.
-   Harmless, but it is why the ASan job runs with `detect_leaks=0`, and fixing
-   it lets that flag come off.
+All four are in. What they cost and what had to be learned:
+
+1. **Return memory without being asked.** ✅ A collection compares committed
+   bytes against demand and, past `tgcTrimRatio` (default 2), hands back every
+   2 MB span holding nothing. On `bench/trim_probe.d` — 2 million objects, 95%
+   dropped — footprint goes 110.9 MB → 23.2 MB one collection later, against
+   staying at 110.9 MB for the life of the process.
+
+   The hysteresis was the whole problem and two obvious answers cost real time.
+   Against what the heap holds *now*: a trim runs at the end of a collection,
+   just after the sweep, so it reads the heap at its trough — true at *every*
+   collection on binary-trees, 7% of total pause and 10% of wall time spent
+   handing back pages that were faulted straight back in. Against the peak since
+   the last collection: fixes that, breaks the multi-threaded case, because every
+   thread's collection resets the window and four workers went from 51 ms of
+   total pause to 145 ms. What ships is the peak over a window of *wall time*,
+   which is the same length however many threads are running and measures
+   nothing on bintree, mt, region or the webserver probe.
+
+   Found along the way, and larger than the item: **macOS was returning no
+   memory at all.** Every `version (Darwin)` branch in the allocator was dead
+   code, because `Darwin` is not a predefined version and this module never
+   derived it. macOS took the generic branch, called `MADV_DONTNEED`, and the
+   kernel ignored it. `MADV_FREE_REUSABLE` now does the work, and it is the only
+   one of the three that moves the number macOS enforces limits against —
+   measured on a 256 MB mapping, footprint 257 MB → 1 MB, where plain
+   `MADV_FREE` moves neither footprint nor RSS.
+2. **Keep the thread-private checks in release builds, optionally.** ✅
+   `-version=TgcEnforce`. In a release build there is no assertion machinery to
+   reuse, so it prints and aborts rather than throwing; CI builds the
+   configuration so it cannot rot.
+3. **`reserve()` still returns 0.** ✅ It maps and faults in what it is asked
+   for, at the segment level rather than by pre-building chunks for a size
+   class — the caller said how much it needs, not what shape it will be in.
+   Reserving 256 MB costs 16 ms and takes 6 ms off the allocation phase that
+   follows.
+4. **Shutdown leak.** ✅ `~ThreadGC` frees every heap still registered and
+   unmaps the segments, as druntime's own collector does. The ASan job now runs
+   with `detect_leaks=1`.
+
+   Not verified locally: ASan still cannot run on macOS/arm64 — the test binary
+   builds and then hangs — so CI is the first execution of the leak check.
+
+While fixing item 1, the oversized-allocation test in `test/tgc_safety.d` turned
+out to be passing on unrelated slack: an unoptimized build keeps a slice's stack
+slot live for the whole enclosing frame, so the 4 MB block was conservatively
+reachable however many times the stack below it was scrubbed. It now allocates
+in its own non-inlined function, and needs no `GC.minimize()` to see the segment
+come back.
 
 ### B. Performance: the mark phase, which is now all that is left
 
@@ -97,6 +129,9 @@ conservative scanning and the cache lines each marked object touches.
 
 Expect single-digit percentages each. Items 5 and 6 are the ones with a
 mechanism behind them rather than a hope.
+
+Next, and what is left before 0.2.0 can be tagged: nothing in this section.
+Item B is optimization, item C needs help from outside the repository.
 
 ### C. Needs someone else
 
@@ -183,11 +218,12 @@ those speculatively and druntime itself does.
 once it exits its arenas move to the orphan heap, where any thread may
 legitimately answer for them.
 
-**What remains open**, and it is smaller than the entry it replaces: the checks
-are asserts, so a `-release` build is back to the old silent behaviour. That is
-the right trade for a hot path, but it means the enforcement is a development
-aid rather than a guarantee. A build-time switch to keep them in release would
-be cheap to add if anyone wants it.
+**What remained open** was that the checks are asserts, so a `-release` build was
+back to the old silent behaviour — a development aid rather than a guarantee.
+`-version=TgcEnforce` now keeps them. It costs two atomic loads on a path a
+correct program never takes, and prints and aborts rather than throwing, because
+a release build has no assertion machinery to reuse. CI builds the configuration
+so it cannot rot.
 
 ---
 
@@ -211,12 +247,12 @@ live set. Peak RSS fell too, 606 MB to 541 MB. Full numbers in `BENCHMARKS.md`.
 
 What this leaves open:
 
-* **Retention is coarser than it was.** A segment is only unmapped when every
-  chunk in it is free, so one live chunk pins 32 MB. `GC.minimize()` covers the
-  gap by handing back each 2 MB span that holds nothing, but nothing calls that
-  automatically. A server that never calls it holds its peak. Worth revisiting:
-  doing the span-level drop during a collection when a segment falls below some
-  occupancy, rather than only on demand.
+* ~~**Retention is coarser than it was.**~~ Fixed. A collection now does the
+  span-level drop itself, gated on committed bytes against peak demand over a
+  window of wall time (`tgcTrimRatio`, default 2). `GC.minimize()` remains the
+  "give it back now" call and ignores both the ratio and the one-segment floor.
+  See item A1 for what the hysteresis had to be, and why the two simpler
+  answers cost 7–10% each.
 * **The segment lock is global.** Chunk-granularity operations are rare enough
   that it has not shown up -- four workers improved 3.6x -- but a
   many-core allocation-heavy workload would be the test, and per-thread segment
@@ -395,11 +431,16 @@ reclaimed because collection is driven purely by that thread's own allocation
 threshold. Consider a cooperative "collect at your next safepoint" flag that
 other threads poll in `alloc`.
 
-### 6. `reserve()` still returns 0
+### 6. `reserve()` — done
 
-Pre-committing arena chunks for a requested size would let latency-sensitive
-callers pay the allocation cost up front. `extend()` now reports usable slack
-but cannot grow a slot.
+It maps and faults in what it is asked for, so a latency-sensitive caller pays
+the page faults up front: reserving 256 MB costs 16 ms and takes 6 ms off the
+allocation phase that follows. Reservation is at the segment level, not by
+pre-building chunks for a size class, because the caller has said how much it
+needs and not what shape it will be in.
+
+`extend()` still reports usable slack but cannot grow a slot, which is
+unchanged and separate.
 
 ### 7. Benchmarks are in the repo, but not in CI
 
@@ -436,10 +477,17 @@ That is also why the sampled-promotion hole in `CROSS-THREAD.md` cannot be
 closed. What tgc gets in exchange is that a thread-local collection has no
 concurrent mutator at all, so it needs no barrier for the common case.
 
-### 9. `ThreadGC` is never destroyed
+### 9. `ThreadGC` is never destroyed — done
 
-The instance is `malloc`'d and `emplace`'d; `roots`/`ranges` leak at shutdown.
-Harmless in practice, untidy.
+`~ThreadGC` frees every heap still registered — the thread that reaches
+`gc_term` is still running, so its heap had never been torn down — and unmaps
+the segments under them, which is what druntime's own collector does from its
+destructor for the same reason.
+
+The instance itself is still not freed, deliberately: `destroy` writes the class
+initialiser back over that memory as soon as the destructor returns, so freeing
+it from inside is a use-after-free. It stays reachable from `gc_instance`, so it
+is not a leak either — just not reclaimed.
 
 ### 10. Sanitizers: run, and clean
 
@@ -479,10 +527,11 @@ Fixed by deleting it -- `sweepOrphanHeap` already publishes the value atomically
 under the lock. It reproduces intermittently, which is the usual shape and the
 reason a sanitizer run is worth repeating rather than doing once.
 
-AddressSanitizer reports zero errors *as CI runs it*, with
-`detect_leaks=0`. With leak detection on it reports one 1056-byte direct leak,
-which is a heap's root/range snapshot buffer never freed at shutdown -- item 9,
-known and deliberate rather than new. Worth fixing before the flag is turned on. Two reclamation assertions are skipped
+AddressSanitizer reports zero errors. `detect_leaks` is now **on**: the leak it
+used to report was the collector never being torn down (item 9), which is fixed,
+so the flag is a check rather than a nuisance. That has not been run locally --
+ASan still cannot execute on macOS/arm64, where the test binary builds and then
+hangs -- so CI is the first execution of it. Two reclamation assertions are skipped
 under `TgcSanitize`: ASan's redzones and quarantine change the stack layout
 enough that a conservative collector never lets the objects go. Reclamation is
 covered by the ordinary builds; the sanitizer run is checking safety.

@@ -836,6 +836,25 @@ unittest
         "the bulk sweep did not return slots to the allocator");
 }
 
+/**
+ * Allocate something larger than a segment and let it die with this frame.
+ *
+ * In its own function, and not inlined, deliberately. An unoptimized build
+ * keeps a slice's stack slot alive for the whole enclosing frame, so a block
+ * allocated *in* the unittest is still conservatively reachable from that frame
+ * however many times the stack below it is scrubbed -- which is why the earlier
+ * version of this test never observed the oversized block being reclaimed at
+ * all, and passed on unrelated slack instead.
+ */
+pragma(inline, false)
+private void allocateOversized()
+{
+    auto big = new ubyte[4 * 1024 * 1024];
+    big[0] = 1;
+    big[$ - 1] = 2;
+    keepAlive(big.ptr);
+}
+
 unittest
 {
     // Segments are mapped, carved into chunks, and handed back to the OS when
@@ -853,28 +872,34 @@ unittest
     scope (exit)
         tgcSegmentSize(saved);
 
-    immutable before = tgcCommittedBytes();
-
-    {
-        auto big = new ubyte[4 * 1024 * 1024];
-        big[0] = 1;
-        big[$ - 1] = 2;
-        keepAlive(big.ptr);
-    }
-
-    immutable peak = tgcCommittedBytes();
-    assert(peak > before, "an allocation larger than a segment mapped nothing");
-
-    scrubStack();
     version (TgcSanitize) enum tries = 40;
     else enum tries = 5;
+
+    // Settle first. Whatever slack earlier tests left is returned here, so the
+    // drop measured below is this allocation's and not theirs.
     foreach (_; 0 .. tries)
     {
         scrubStack();
         GC.collect();
     }
     GC.minimize();
+    immutable before = tgcCommittedBytes();
 
+    allocateOversized();
+
+    immutable peak = tgcCommittedBytes();
+    assert(peak > before, "an allocation larger than a segment mapped nothing");
+
+    scrubStack();
+    foreach (_; 0 .. tries)
+    {
+        scrubStack();
+        GC.collect();
+    }
+
+    // No `GC.minimize()`: a run that only holds its own segment gets it back
+    // when the last chunk in it is freed, without being asked.
+    //
     // Sanitizer builds keep freed memory referenced from quarantine and shift
     // the stack layout, so a conservative collector holds on to far more; what
     // that run checks is safety, not reclamation.

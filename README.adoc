@@ -58,7 +58,9 @@ Misuse is now detected rather than silent: `GC.free`, `realloc`, `setAttr` and
 the array-mutating calls assert when handed a block belonging to another
 thread's heap. Read-only queries such as `GC.sizeOf` stay quiet and answer
 "no block", because callers ask those speculatively. The checks are asserts, so
-they cost nothing in a `-release` build.
+a `-release` build is silent again; build with `-version=TgcEnforce` to keep
+them, which costs two atomic loads on a path a correct program never takes and
+turns a development aid into a guarantee.
 +
 `tgcTrackEscapes(true)` opts into retaining anything seen reachable from a
 global, which covers the common publish-to-a-global handoff. It is off by
@@ -76,6 +78,14 @@ at allocation time, and what can.
 * `GC.collect()` collects only the calling thread's heap. A thread that never
   allocates never collects.
 * Marking is conservative; no precise scanning or moving/compaction.
+
+Memory is returned to the OS without being asked: a collection compares
+committed bytes against peak demand over the preceding half-second and, past
+`tgcTrimRatio` (2 by default), hands back every 2 MB span holding nothing.
+`GC.minimize()` still exists for "give it back now" and ignores both the ratio
+and the one-segment floor. `GC.reserve(n)` maps and faults in `n` bytes up
+front, so a latency-sensitive caller pays for the pages before its first
+request rather than inside it.
 
 Fibers are supported: every registered stack context is scanned, not just the
 running one. Building a server on this? See link:WEBSERVER.md[WEBSERVER.md].

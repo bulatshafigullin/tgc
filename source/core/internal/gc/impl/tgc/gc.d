@@ -41,6 +41,7 @@ import core.thread.threadbase : ThreadBase;
 
 import cstdlib = core.stdc.stdlib : calloc, free, malloc, realloc;
 import core.stdc.string : memcpy, memset;
+import core.time : dur, Duration, MonoTime;
 static import core.memory;
 
 extern (C) noreturn onOutOfMemoryError(void* pretend_sideffect = null, string file = __FILE__, size_t line = __LINE__) @trusted pure nothrow @nogc; /* dmd @@@BUG11461@@@ */
@@ -287,6 +288,10 @@ private void* threadTLSData(ThreadBase t) nothrow @nogc
 /// `align(16)` aggregates depend on it; an aligned SSE store into an 8-aligned
 /// block faults on x86-64.
 private enum size_t payloadAlign = 16;
+
+/// Assumed cache-line size. Only ever used for alignment, so being wrong on a
+/// target with 128-byte lines costs padding, not correctness.
+private enum size_t cacheLine = 64;
 
 /**
  * Arena granularity. Chunks are allocated aligned to their own size, so
@@ -564,12 +569,50 @@ extern (C) size_t tgc_getSegmentSize() nothrow @nogc
 /**
  * Bytes of chunk storage currently backed by memory, allocated or not.
  *
- * Falls when a segment is unmapped, and when `GC.minimize()` hands back the
+ * Falls when a segment is unmapped, when a collection trims a heap that has
+ * shrunk (see `tgc_setTrimRatio`), and when `GC.minimize()` hands back the
  * huge-page-aligned spans inside a segment that hold nothing.
  */
 extern (C) size_t tgc_getCommittedBytes() nothrow @nogc
 {
     return atomicLoad(committedBytes);
+}
+
+/*
+ * Automatic return of committed memory.
+ *
+ * Without this the only paths that give memory back are an entire segment
+ * falling empty and `GC.minimize()`. A server that never calls `minimize`
+ * therefore holds its peak for the life of the process: one live chunk pins the
+ * whole 32 MB segment it sits in. That is the single most likely thing about
+ * this collector to be reported as a leak.
+ *
+ * The trigger is a ratio rather than an occupancy threshold, because occupancy
+ * per segment says nothing about whether the *program* still needs the memory.
+ * A heap that is growing has low occupancy in the segment it is filling and
+ * high demand; a heap that has shrunk has low occupancy everywhere and no
+ * demand. Committed bytes against *peak* chunk bytes separates the two, and a
+ * floor of one segment keeps a small program from giving back the memory it is
+ * about to ask for again.
+ *
+ * What "peak" is measured over is the part that had to be measured rather than
+ * reasoned about; `segTrim` records what each of the simpler answers cost.
+ */
+private enum size_t defaultTrimRatio = 2;
+
+private shared size_t trimRatio = defaultTrimRatio;
+
+/// Committed bytes may exceed in-use chunk bytes by this factor before a
+/// collection hands the difference back. 0 disables automatic return.
+extern (C) void tgc_setTrimRatio(size_t factor) nothrow @nogc
+{
+    atomicStore(trimRatio, factor);
+}
+
+/// ditto
+extern (C) size_t tgc_getTrimRatio() nothrow @nogc
+{
+    return atomicLoad(trimRatio);
 }
 
 private struct Segment
@@ -601,8 +644,17 @@ private __gshared size_t segCount;
 private __gshared size_t segCap;
 private __gshared Segment* segMru;    /// last segment an allocation came from
 private __gshared size_t segEmpty;    /// segments holding nothing
+private __gshared size_t segUsedUnits; /// chunks handed out, across every segment
+private __gshared size_t segPeakUnits; /// high-water of `segUsedUnits` in this window
+private __gshared MonoTime segTrimLast; /// when the current trim window opened
 private __gshared SpinLock segLock;
 private shared size_t committedBytes;
+
+/// How long a window of peak demand the trim judges on. Long enough that a
+/// heap oscillating between collections is measured at its peak rather than
+/// its trough, short enough that a burst's memory comes back promptly once the
+/// burst is over.
+private enum Duration trimWindow = dur!"msecs"(500);
 
 /// Address range spanned by every segment, so `inTgcChunk` can reject a
 /// pointer that is nowhere near the heap without taking the lock. Widened
@@ -612,6 +664,25 @@ private shared size_t segLoAddr = size_t.max;
 private shared size_t segHiAddr;
 
 // -- platform mapping -------------------------------------------------------
+
+/*
+ * `Darwin` is not a predefined version -- druntime derives it per module, and a
+ * module that forgets to has its Darwin branches silently compiled out. That
+ * had happened here: every `version (Darwin)` below was dead, so macOS took the
+ * generic branch and called `MADV_DONTNEED`, which on Darwin is advice the
+ * kernel is free to ignore for anonymous memory and does. The effect was that
+ * `GC.minimize()` returned nothing at all on macOS -- it unmapped whole empty
+ * segments and quietly failed to hand back anything inside a segment still in
+ * use.
+ */
+version (OSX)
+    version = Darwin;
+else version (iOS)
+    version = Darwin;
+else version (TVOS)
+    version = Darwin;
+else version (WatchOS)
+    version = Darwin;
 
 version (Posix)
 {
@@ -631,6 +702,14 @@ version (Posix)
     else version (Darwin)
     {
         private enum int MADV_FREE = 5;
+        // What libmalloc uses to give memory back. Unlike MADV_FREE it drops
+        // the pages out of the process's footprint immediately rather than
+        // leaving them resident until the system wants them, which is the
+        // difference between a trim that shows up in RSS and one that does not.
+        // MADV_FREE_REUSE is its counterpart, and re-establishes the
+        // accounting before the range is written to again.
+        private enum int MADV_FREE_REUSABLE = 7;
+        private enum int MADV_FREE_REUSE = 8;
     }
     else
     {
@@ -690,18 +769,29 @@ version (Posix)
         version (linux)
             madvise(p, size, MADV_DONTNEED);
         else version (Darwin)
-            madvise(p, size, MADV_FREE);
+        {
+            // MADV_FREE_REUSABLE is refused for a range that is wired or has an
+            // unexpected state; MADV_FREE always works and is the weaker
+            // guarantee, so it is the fallback rather than the default.
+            if (madvise(p, size, MADV_FREE_REUSABLE) != 0)
+                madvise(p, size, MADV_FREE);
+        }
         else
             madvise(p, size, MADV_DONTNEED);
     }
 
     private void recommit(void* p, size_t size) nothrow @nogc
     {
-        // Nothing to do: the mapping never went away, so the next touch faults
-        // a fresh page in. Re-advising huge pages is worth it on Linux, where
-        // MADV_DONTNEED clears the flag for the range.
+        // On most POSIX targets there is nothing to do: the mapping never went
+        // away, so the next touch faults a fresh page in.
         version (linux)
+        {
+            // Re-advising is not optional here: MADV_DONTNEED clears the
+            // huge-page flag for the range.
             madvise(p, size, MADV_HUGEPAGE);
+        }
+        else version (Darwin)
+            madvise(p, size, MADV_FREE_REUSE);
     }
 }
 else version (Windows)
@@ -905,6 +995,24 @@ private enum size_t unitsPerSpan = hugePageSize / chunkSize;
 private void* segTake(Segment* s, size_t at, size_t n) nothrow @nogc
 {
     // Take back anything `segDropFree` handed to the OS under these units.
+    segRecommitRun(s, at, n);
+
+    foreach (k; 0 .. n)
+        setBit(s.inUse, at + k);
+    if (s.freeUnits == s.units)
+        segEmpty--;
+    s.freeUnits -= n;
+    segUsedUnits += n;
+    if (segUsedUnits > segPeakUnits)
+        segPeakUnits = segUsedUnits;
+    s.hint = at + n;
+    return s.unitAddr(at);
+}
+
+/// Commit every huge-page span under `[at, at + n)` that was handed back.
+/// Called under `segLock`.
+private void segRecommitRun(Segment* s, size_t at, size_t n) nothrow @nogc
+{
     immutable size_t firstSpan = at / unitsPerSpan;
     immutable size_t lastSpan = (at + n - 1) / unitsPerSpan;
     foreach (span; firstSpan .. lastSpan + 1)
@@ -916,14 +1024,6 @@ private void* segTake(Segment* s, size_t at, size_t n) nothrow @nogc
         s.decommittedUnits -= unitsPerSpan;
         atomicOp!"+="(committedBytes, hugePageSize);
     }
-
-    foreach (k; 0 .. n)
-        setBit(s.inUse, at + k);
-    if (s.freeUnits == s.units)
-        segEmpty--;
-    s.freeUnits -= n;
-    s.hint = at + n;
-    return s.unitAddr(at);
 }
 
 // -- the interface the heap uses --------------------------------------------
@@ -1017,6 +1117,188 @@ private void segDropFree(Segment* s) nothrow @nogc
     }
 }
 
+/**
+ * Hand back what a shrunken heap is no longer using. Called after every
+ * collection.
+ *
+ * Does nothing while committed memory is within `trimRatio` of peak demand over
+ * the last window, which is what keeps a breathing heap from thrashing: the
+ * headroom a program keeps is proportional to what it has been using, so memory
+ * goes back only after demand has genuinely fallen. Past that, every free 2 MB
+ * span in every segment goes back -- see below for why "enough to reach the
+ * target" is the wrong amount.
+ */
+private void segTrim() nothrow @nogc
+{
+    immutable size_t ratio = atomicLoad(trimRatio);
+    if (ratio == 0)
+        return;
+
+    segLock.lock(); tsanAcquire(cast(const(void)*) &segLock);
+    scope (exit)
+    {
+        tsanRelease(cast(const(void)*) &segLock);
+        segLock.unlock();
+    }
+
+    // Peak demand over a window of wall time, not what is held right now, and
+    // not since the last collection either. Both of the simpler answers were
+    // tried and both cost real time:
+    //
+    // * Against what is held *now*: a trim runs at the end of a collection,
+    //   just after the sweep freed everything it was going to, so it reads the
+    //   heap at its trough. On binary-trees "committed is more than twice what
+    //   is held" was then true at every single collection, and the pages handed
+    //   back were faulted straight back in -- 7% of total pause and 10% of wall
+    //   time, for a heap that was not shrinking at all.
+    //
+    // * Against the peak since the last collection: fixes the single-threaded
+    //   case and breaks the multi-threaded one. Every thread's collection
+    //   resets the window, so with four of them the window is a quarter as
+    //   long, the observed peak drops toward the trough, and the thrash comes
+    //   back -- total pause on the four-worker benchmark went from 51 ms to
+    //   145 ms.
+    //
+    // A window of wall time is the same length however many threads are
+    // running, and matches what the property is actually worth to a user:
+    // memory comes back shortly after demand falls, and a program still using
+    // it keeps it.
+    immutable now = MonoTime.currTime;
+    if (segTrimLast == MonoTime.init)
+    {
+        // First call: start the window rather than judging on no history.
+        segTrimLast = now;
+        return;
+    }
+    if (now - segTrimLast < trimWindow)
+        return;
+    segTrimLast = now;
+
+    immutable size_t peakUnits = segPeakUnits > segUsedUnits ? segPeakUnits : segUsedUnits;
+    segPeakUnits = segUsedUnits; // the next window's peak starts from here
+    immutable size_t inUse = peakUnits * chunkSize;
+
+    // A ratio large enough to overflow means "never trim", which is what the
+    // multiplication would otherwise wrap into the opposite of.
+    if (inUse != 0 && ratio > size_t.max / inUse)
+        return;
+
+    size_t target = inUse * ratio;
+    // A floor of one segment, so a program whose live set fits in a corner of
+    // its first segment does not keep handing back the pages it is about to
+    // fault in again.
+    immutable size_t floor = atomicLoad(segmentSizeBytes);
+    if (target < floor)
+        target = floor;
+
+    if (atomicLoad(committedBytes) <= target)
+        return;
+
+    // Past the trigger, everything free goes back rather than just enough to
+    // reach the target. Stopping at the target sounds tidier and measured
+    // *worse*: `committedBytes` counts a freshly mapped segment in full, but
+    // POSIX mapping is lazy, so the newest segments -- the ones the loop reaches
+    // first -- are the least resident. Trimming those satisfied the arithmetic
+    // while leaving the older, genuinely resident pages alone: committed fell
+    // to 32 MB and RSS only from 112 MB to 66 MB, against 34 MB for handing
+    // back the lot. The ratio decides *whether* to trim; it is a poor guide to
+    // how much.
+    size_t i = segCount;
+    while (i > 0)
+    {
+        i--;
+        auto s = segTable[i];
+        if (s.freeUnits == s.units && segEmpty > 1)
+            segDestroy(i);
+        else
+            segDropFree(s);
+    }
+}
+
+/**
+ * Make `bytes` of chunk storage available and resident, backing `GC.reserve`.
+ *
+ * Mapping a segment is lazy on POSIX, so a heap that has never been touched
+ * pays a page fault per page on its first pass through -- inside whatever the
+ * program is doing at the time, which for the workloads this collector is aimed
+ * at is a request. This maps what is missing and writes one byte per page, so
+ * that cost is paid here instead.
+ *
+ * Returns: bytes actually made resident, which is less than asked for only if
+ * the mapping failed.
+ */
+private size_t segReserve(size_t bytes) nothrow @nogc
+{
+    if (bytes == 0)
+        return 0;
+    immutable size_t want = alignUp(bytes, chunkSize) / chunkSize;
+
+    segLock.lock(); tsanAcquire(cast(const(void)*) &segLock);
+    scope (exit)
+    {
+        tsanRelease(cast(const(void)*) &segLock);
+        segLock.unlock();
+    }
+
+    // Enough free units to satisfy the request, mapping more segments if not.
+    // Dedicated segments are excluded: they exist to hold one oversized run and
+    // are released whole.
+    size_t free_ = 0;
+    foreach (i; 0 .. segCount)
+        if (!segTable[i].dedicated)
+            free_ += segTable[i].freeUnits;
+
+    while (free_ < want)
+    {
+        immutable size_t segBytes = atomicLoad(segmentSizeBytes);
+        auto s = segCreate(segBytes, false);
+        if (!s)
+            break;
+        free_ += s.units;
+    }
+
+    size_t got = 0;
+    foreach (i; 0 .. segCount)
+    {
+        auto s = segTable[i];
+        if (s.dedicated)
+            continue;
+        for (size_t u = 0; u < s.units && got < want; u++)
+        {
+            if (testBit(s.inUse, u))
+                continue;
+            segRecommitRun(s, u, 1);
+            segTouch(s.unitAddr(u), chunkSize);
+            got++;
+        }
+        if (got >= want)
+            break;
+    }
+    return got * chunkSize;
+}
+
+/**
+ * Fault in every page of `[p, p + size)`.
+ *
+ * A write, not a read: reading anonymous memory maps the shared zero page and
+ * leaves the real fault for the first store. On Linux the first store in a
+ * huge-page-aligned span materialises the whole 2 MB, so the remaining stores
+ * in that span cost nothing.
+ */
+private void segTouch(void* p, size_t size) nothrow @nogc
+{
+    import core.volatile : volatileStore;
+
+    // The smallest page any supported target uses. Touching more often than the
+    // real page size costs a store to an already-resident page, which is
+    // cheaper than querying the page size on this path.
+    enum size_t touchStride = 4096;
+
+    auto q = cast(ubyte*) p;
+    for (size_t off = 0; off < size; off += touchStride)
+        volatileStore(q + off, cast(ubyte) 0);
+}
+
 private void segReleaseEmpty() nothrow @nogc
 {
     segLock.lock(); tsanAcquire(cast(const(void)*) &segLock);
@@ -1034,6 +1316,92 @@ private void segReleaseEmpty() nothrow @nogc
             segDestroy(i);
         else
             segDropFree(segTable[i]);
+    }
+}
+
+/**
+ * Unmap every segment and free the table. Shutdown only.
+ *
+ * Unlike `segReleaseEmpty` this does not care whether a segment still holds
+ * live chunks: nothing may touch GC memory after the collector is destroyed,
+ * which is the same contract druntime's own collector has -- it unmaps its
+ * pools from its destructor too.
+ */
+private void segReleaseAll() nothrow @nogc
+{
+    segLock.lock(); tsanAcquire(cast(const(void)*) &segLock);
+    scope (exit)
+    {
+        tsanRelease(cast(const(void)*) &segLock);
+        segLock.unlock();
+    }
+
+    while (segCount)
+    {
+        auto s = segTable[segCount - 1];
+        // `segDestroy` keeps the empty-segment count, which only makes sense
+        // for a segment that really is empty; here it is being torn down
+        // regardless, so account for it as empty first.
+        if (s.freeUnits != s.units)
+            segEmpty++;
+        segDestroy(segCount - 1);
+    }
+
+    cstdlib.free(segTable);
+    segTable = null;
+    segCap = 0;
+    segMru = null;
+    segEmpty = 0;
+    segUsedUnits = 0;
+    segPeakUnits = 0;
+    segTrimLast = MonoTime.init;
+}
+
+/*
+ * Thread-private ownership: enforced, or merely documented.
+ *
+ * The check that catches `GC.free` on another thread's block was an `assert`,
+ * so `-release` turned it back off and the mistake went back to being silent --
+ * a development aid rather than a guarantee. It costs two atomic loads, and
+ * only on the path where the pointer did not resolve locally, so keeping it is
+ * affordable for anyone who would rather have the guarantee.
+ *
+ * `version(TgcEnforce)` asks for that. Without it the check follows assertions,
+ * as before.
+ */
+version (TgcEnforce)
+    private enum bool enforceThreadPrivate = true;
+else version (assert)
+    private enum bool enforceThreadPrivate = true;
+else
+    private enum bool enforceThreadPrivate = false;
+
+/**
+ * Report a mutation aimed at a block this thread does not own.
+ *
+ * Throws an `AssertError` where assertions exist, so a test can catch it and
+ * the message reaches the usual place. In a release build with `TgcEnforce`
+ * there is no assertion machinery to use, so it prints and aborts: the point of
+ * asking for the check in release is to stop, not to carry on with a corrupted
+ * heap.
+ */
+private noreturn foreignBlockError() nothrow @nogc
+{
+    enum string msg =
+        "tgc: this pointer belongs to another thread's heap. tgc heaps " ~
+        "are thread-private: a block is owned by the thread that " ~
+        "allocated it, and only that thread may free, resize or " ~
+        "re-attribute it. Transfer ownership by copying, or by " ~
+        "`immutable`, rather than by pointer.\n";
+
+    version (assert)
+        assert(false, msg);
+    else
+    {
+        import core.internal.abort : abort;
+
+        abort(msg);
+        assert(0);
     }
 }
 
@@ -1094,6 +1462,7 @@ private void chunkFree(void* p, size_t bytes) nothrow @nogc
     foreach (k; 0 .. n)
         clearBit(s.inUse, at + k);
     s.freeUnits += n;
+    segUsedUnits -= n;
     if (at < s.hint)
         s.hint = at;
 
@@ -1338,7 +1707,6 @@ private struct Chunk
             return slotCount;
 
         size_t bits = allocBits[w] & ~markBits[w] & ~sharedBits[w];
-        // Mask off slots before `from` in the first word.
         immutable size_t off = from % bitsPerWord;
         if (off)
             bits &= ~cast(size_t) 0 << off;
@@ -1805,8 +2173,6 @@ private struct ThreadHeap
         auto c = cast(Chunk*) raw;
         immutable size_t bitsOff = alignUp(Chunk.sizeof, size_t.sizeof);
 
-        // Per slot: SlotMeta, one attribute byte, and three bits of state.
-        // Solve for the count that fits, then lay the regions out in order.
         size_t count = (bytes - bitsOff) * 8 / (slotSize * 8 + SlotMeta.sizeof * 8 + 8 + 3);
         size_t dataOff, metaOff, attrOff, markOff, sharedOff;
         for (;;)
@@ -1856,8 +2222,6 @@ private struct ThreadHeap
 
     Chunk* newLargeChunk(size_t size, Region* region) nothrow @nogc
     {
-        // A large chunk holds exactly one slot, so one word of each bitvector
-        // and one attribute byte suffice.
         immutable size_t bitsOff = alignUp(Chunk.sizeof, size_t.sizeof);
         immutable size_t markOff = bitsOff + size_t.sizeof;
         immutable size_t sharedOff = markOff + size_t.sizeof;
@@ -2158,8 +2522,6 @@ private struct ThreadHeap
 
         foreach (w; 0 .. words)
         {
-            // Promoted slots are excluded, exactly as nextReclaimable does:
-            // only a global collection can prove no other thread holds them.
             immutable size_t dead = c.allocBits[w] & ~c.markBits[w] & ~c.sharedBits[w];
             if (!dead)
                 continue;
@@ -2225,6 +2587,45 @@ private void registerHeap(ThreadHeap* h) nothrow @nogc
         allHeapsCap = ncap;
     }
     allHeaps[allHeapsLen++] = h;
+    tsanRelease(cast(const(void)*) &heapsLock); heapsLock.unlock();
+}
+
+/**
+ * Free every heap still registered, and the registry with it. Shutdown only.
+ *
+ * The main thread's heap is the one this is really for: `cleanupThread` runs
+ * for threads that exit, but the thread that reaches `gc_term` is still
+ * running, so its heap -- its chunk directory, mark stack and root snapshot
+ * buffers -- was still allocated when the process ended. Together with the
+ * orphan heap, which no thread owns and nothing ever tears down, that is the
+ * leak LeakSanitizer reported, and the reason the ASan job used to run with
+ * `detect_leaks=0`.
+ */
+private void destroyAllHeaps() nothrow @nogc
+{
+    heapsLock.lock(); tsanAcquire(cast(const(void)*) &heapsLock);
+    foreach (i; 0 .. allHeapsLen)
+    {
+        auto h = allHeaps[i];
+        // A region left open at exit owns no memory of its own beyond this
+        // node -- its chunks go back with the segments.
+        auto r = h.regions;
+        while (r)
+        {
+            auto next = r.next;
+            cstdlib.free(r);
+            r = next;
+        }
+        h.regions = null;
+        h.destroy();
+        cstdlib.free(h);
+    }
+    allHeapsLen = 0;
+    allHeapsCap = 0;
+    cstdlib.free(allHeaps.ptr);
+    allHeaps = null;
+    orphanHeap = null;
+    tlsHeap = null;
     tsanRelease(cast(const(void)*) &heapsLock); heapsLock.unlock();
 }
 
@@ -2860,8 +3261,29 @@ class ThreadGC : GC
         cast(void) currentHeap();
     }
 
+    /**
+     * Tear the collector down. druntime calls this from `gc_term`, after module
+     * destructors and after every registered thread has been joined.
+     *
+     * Nothing may touch GC memory afterwards, which is why the segments go too:
+     * that is the same contract druntime's own collector has, and its
+     * destructor unmaps its pools for the same reason. Without this the process
+     * exits holding every heap it ever created -- harmless, since the OS
+     * reclaims it, but indistinguishable to LeakSanitizer from a real leak, and
+     * that is what kept `detect_leaks=0` on the ASan job.
+     *
+     * The instance itself is not freed here: `destroy` writes the class
+     * initialiser back over this memory as soon as the destructor returns, so
+     * freeing it from inside is a use-after-free. It stays reachable from
+     * `gc_instance`, so it is not a leak either -- just not reclaimed.
+     */
     ~this()
     {
+        // `roots` and `ranges` are `Array`, whose destructors the compiler runs
+        // after this one.
+        destroyAllHeaps();
+        segReleaseAll();
+        gc_instance = null;
     }
 
     void enable()
@@ -3013,9 +3435,22 @@ class ThreadGC : GC
         return 0;
     }
 
+    /**
+     * Map and fault in `size` bytes of chunk storage up front.
+     *
+     * Reserving is deliberately done at the segment level rather than by
+     * pre-building chunks for a size class: the caller has said how much it
+     * will need, not what shape it will be in, and a guess at the shape would
+     * either sit unused or force the first real allocation to build its chunk
+     * anyway. What it does buy is the part that is actually expensive and
+     * actually unavoidable -- the page faults -- paid here instead of inside
+     * the first request.
+     *
+     * Returns: bytes made resident, rounded up to a whole chunk.
+     */
     size_t reserve(size_t size) nothrow
     {
-        return 0;
+        return segReserve(size);
     }
 
     void free(void* p) nothrow @nogc
@@ -3353,13 +3788,11 @@ private:
     BlkRef queryBlockToMutate(void* p) nothrow @nogc
     {
         auto b = queryBlock(p);
-        if (!b.valid())
-            assert(!inTgcChunk(p),
-                "tgc: this pointer belongs to another thread's heap. tgc heaps " ~
-                "are thread-private: a block is owned by the thread that " ~
-                "allocated it, and only that thread may free, resize or " ~
-                "re-attribute it. Transfer ownership by copying, or by " ~
-                "`immutable`, rather than by pointer.");
+        static if (enforceThreadPrivate)
+        {
+            if (!b.valid() && inTgcChunk(p))
+                foreignBlockError();
+        }
         return b;
     }
 
@@ -3600,6 +4033,13 @@ private:
             c = nextChunk;
         }
         heap.finalizing = false;
+
+        // Give back what the program has stopped using. Empty chunks went back
+        // to the segment allocator above, which keeps them mapped; this is what
+        // decides that the heap has genuinely shrunk and hands the pages under
+        // them to the OS. Inside the measured pause on purpose -- it is work a
+        // collection does, and pretending otherwise would hide its cost.
+        segTrim();
 
         // Recompute the trigger from what actually survived. The previous
         // scheme only ever raised the threshold, so a program that spiked once

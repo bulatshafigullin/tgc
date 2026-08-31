@@ -94,6 +94,24 @@ the escape the verifier exists to catch. The verifier was right both times.
   same value atomically under the lock, so the store is simply gone. Found by
   ThreadSanitizer on Linux/x86-64.
 
+* *macOS returned no memory at all.* Every `version (Darwin)` branch in the
+  segment allocator was dead code: `Darwin` is not a predefined version, and
+  this module never derived it, so macOS fell through to the generic branch and
+  called `MADV_DONTNEED` -- advice the Darwin kernel is free to ignore for
+  anonymous memory, and does. `GC.minimize()` could unmap whole empty segments
+  and quietly failed to hand back anything inside a segment still in use. The
+  Darwin path now uses `MADV_FREE_REUSABLE`, which is what libmalloc uses and
+  the only one of the three that moves the number macOS enforces limits
+  against: measured on a 256 MB mapping, footprint 257 MB -> 1 MB, where plain
+  `MADV_FREE` moved neither footprint nor RSS.
+* *The collector is torn down at exit.* `ThreadGC` had an empty destructor, so
+  every heap ever created -- its chunk directory, mark stack and root snapshot
+  buffers -- plus every segment under them outlived the process. Harmless, since
+  the OS reclaims it, but indistinguishable to LeakSanitizer from a real leak,
+  which is why the ASan job ran with `detect_leaks=0`. `~ThreadGC` now frees the
+  heaps and unmaps the segments, as druntime's own collector does, and the flag
+  is off.
+
 === Changed — performance
 
 * *Chunks come from large mappings instead of from `malloc`.* Each 64 KiB chunk
@@ -326,6 +344,26 @@ Scaling is now linear rather than quadratic.
 * Pause time is measured: `profileStats()` reports `totalPauseTime` and
   `maxPauseTime`. `profilePauseTicks` was declared and never written.
 
+* *Memory is returned to the OS without being asked.* A segment is unmapped
+  only when every chunk in it is free, so one live chunk pinned 32 MB and a
+  process held its peak until something called `GC.minimize()` -- a surprising
+  default, and the most likely thing about this collector to be reported as a
+  leak. A collection now compares committed bytes against demand and, past
+  `tgcTrimRatio`, hands back every 2 MB span holding nothing. Measured on
+  `bench/trim_probe.d`: 2 million objects, 95% dropped, footprint 110.9 MB ->
+  23.2 MB one collection later, against staying at 110.9 MB indefinitely.
++
+The hysteresis took three attempts and two of them cost real time, which is
+recorded in `segTrim` because the shape is not obvious. Comparing against what
+the heap holds *now* reads it at its trough -- a trim runs at the end of a
+collection, just after the sweep -- and made the test true at every collection
+on binary-trees: 7% of total pause and 10% of wall time handing back pages that
+were immediately faulted in again. Comparing against the peak since the last
+collection fixes that and breaks the multi-threaded case, where every thread's
+collection resets the window: four workers went from 51 ms of total pause to
+145 ms. The peak over a window of *wall time* is the same length however many
+threads are running, and measures nothing on any of the benchmarks.
+
 === Added
 
 * `tgcMinHeap(size_t)` — a floor on a thread's collection threshold, the
@@ -411,6 +449,21 @@ Two limits remain, both documented in `CROSS-THREAD.md`: promotion is *sampled*
 at collection time, so a block published and unpublished entirely between two
 collections is never seen; and promoted blocks accumulate until a cooperative
 global collection exists to reclaim them.
+
+* `GC.reserve(n)` maps and faults in `n` bytes of chunk storage instead of
+  returning 0, so a latency-sensitive caller pays the page faults up front
+  rather than inside its first request. Measured: reserving 256 MB costs 16 ms
+  and takes 6 ms off the allocation phase that follows. It reserves at the
+  segment level rather than pre-building chunks for a size class -- the caller
+  said how much it needs, not what shape it will be in.
+* `tgcTrimRatio(size_t)` — headroom a collection leaves committed, as a
+  multiple of peak demand. Default 2; 0 restores the old "never return memory
+  automatically" behaviour.
+* `-version=TgcEnforce` keeps the thread-private ownership checks in a
+  `-release` build. They are asserts, so `-release` turned them off and handing
+  a block to another thread went back to being silent; the switch costs two
+  atomic loads on a path a correct program never takes, and prints and aborts
+  rather than throwing, since a release build has no assertion machinery to use.
 
 === Fixed — found by ThreadSanitizer
 
@@ -539,6 +592,23 @@ program that combined a live linked structure with phobos string formatting.
 Regression tests added in `test/tgc_stress.d` cover both `GC.extend`'s contract
 and the formatting-plus-live-structure pattern; both fail against the previous
 commit.
+
+* `bench/trim_probe.d` (`dub build --config=bench-trim`) measures whether a
+  shrunken heap gives its memory back, and what `GC.reserve` buys. It reports
+  the process footprint alongside RSS, because on macOS the two disagree and
+  RSS is the wrong one: `MADV_FREE_REUSABLE` leaves pages resident until the
+  system wants them, so only the footprint ledger moves.
+* `test/tgc_memory.d` covers the automatic return, `GC.reserve`, and that
+  `GC.minimize()` never leaves more committed than a collection did.
+* The oversized-allocation test in `test/tgc_safety.d` was passing on unrelated
+  slack. An unoptimized build keeps a slice's stack slot live for the whole
+  enclosing frame, so the 4 MB block it allocated was conservatively reachable
+  however many times the stack below it was scrubbed, and the drop it asserted
+  on was other tests' free space. The allocation now happens in its own
+  non-inlined function, and the test needs no `GC.minimize()` to see the
+  segment come back.
+* CI builds `--build=release --d-version=TgcEnforce`, the one configuration
+  where the ownership check cannot fall back on the assertion machinery.
 
 === Fixed — found during this work
 

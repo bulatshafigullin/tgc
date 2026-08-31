@@ -71,6 +71,12 @@ jobs:
       # cannot see any of it.
       - name: Test (optimized)
         run: dub test --build=unittest-optimized
+      # The thread-private ownership checks are asserts, so -release turns them
+      # off. `TgcEnforce` keeps them, and that build has to keep compiling --
+      # it is the one configuration where the check cannot fall back on the
+      # assertion machinery and has to print and abort instead.
+      - name: Build with TgcEnforce
+        run: dub build --build=release --d-version=TgcEnforce
 
   sanitizers:
     name: ldc / ${{ matrix.sanitizer }}
@@ -98,8 +104,13 @@ jobs:
       # The suppressions file covers only what is not tgc's to fix. tgc's own
       # spinlock-guarded structures are annotated in the source with
       # __tsan_acquire/__tsan_release instead, so they stay checked.
+      #
+      # Leak detection is on. It used to be off because the collector was never
+      # torn down -- every heap, and the segments under them, outlived the
+      # process -- which LeakSanitizer cannot tell from a real leak. `~ThreadGC`
+      # now frees them, so the flag is a check rather than a nuisance.
       - name: Test under -fsanitize=${{ matrix.sanitizer }}
         env:
-          ASAN_OPTIONS: detect_leaks=0:detect_stack_use_after_return=0
+          ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=0
           TSAN_OPTIONS: halt_on_error=1:suppressions=${{ github.workspace }}/.tsan-suppressions
         run: dub test --compiler=ldc2 --build=${{ matrix.build }}

@@ -252,11 +252,44 @@ size_t tgcSegmentSize() nothrow @nogc
  *
  * Memory is kept back rather than returned on the spot, because handing back
  * pages a growing heap is about to ask for again is exactly the fault this
- * allocator exists to avoid. `GC.minimize()` returns it: empty segments are
- * unmapped, and inside a segment still in use, every 2 MB span holding nothing
- * is handed back.
+ * allocator exists to avoid. Three things return it: a collection, once this
+ * figure exceeds recent peak demand by `tgcTrimRatio`; a segment falling
+ * entirely empty; and `GC.minimize()`, which hands back every 2 MB span holding
+ * nothing, whatever the ratio says.
  */
 size_t tgcCommittedBytes() nothrow @nogc
 {
     return tgc_getCommittedBytes();
+}
+
+/**
+ * Headroom a collection leaves committed, as a multiple of recent peak demand.
+ * Default 2; 0 never returns memory automatically.
+ *
+ * A segment is only unmapped once every chunk in it is free, so without this a
+ * single live chunk pins 32 MB and a process holds its peak until it calls
+ * `GC.minimize()`. A collection compares committed bytes against the most
+ * chunk memory the program held at any point in the last half-second and, above
+ * this factor, hands back the 2 MB spans that hold nothing.
+ *
+ * *Peak* rather than what the heap holds when the collection ends, because that
+ * moment is its trough -- the sweep has just run. Comparing against the trough
+ * makes the test true on every collection of an ordinary oscillating heap, and
+ * the memory handed back is faulted straight in again; measured, that cost 7%
+ * of pause time on a heap that was not shrinking at all. Against the peak, a
+ * breathing heap keeps its headroom and only a program whose demand has
+ * actually fallen hands anything back.
+ *
+ * Raise the factor to favour throughput, lower it to favour resident size;
+ * whatever the setting, at least one segment is always kept.
+ */
+void tgcTrimRatio(size_t factor) nothrow @nogc
+{
+    tgc_setTrimRatio(factor);
+}
+
+/// ditto
+size_t tgcTrimRatio() nothrow @nogc
+{
+    return tgc_getTrimRatio();
 }

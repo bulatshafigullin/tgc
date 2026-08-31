@@ -21,3 +21,4 @@ dub.selections.json
 /bench-region
 /bench/results/
 /bench-webserver
+/bench-trim
