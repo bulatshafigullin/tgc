@@ -165,12 +165,23 @@ conservative scanning and the cache lines each marked object touches.
    M-series hardware already runs ahead of a sequential range scan; what is left
    after that is the pointer-chase, and a prefetch issued from the scan cannot
    see far enough down it to help.
-8. **Re-test multiply-by-reciprocal on x86-64.** It measured *slower* on arm64
-   and was reverted; the 32-bit divide that replaced it is cheap there but
-   x86-64's divider is not, and that half was never measured. Untested here for
-   the same reason: there is no x86-64 machine in this loop.
+8. ~~**Re-test multiply-by-reciprocal on x86-64.**~~ ❌ Measured on x86-64 and
+   rejected. `idx = off / slotSize` became `(off * M) >> 42` with a per-chunk
+   `M = ceil(2^42 / slotSize)`, which is exact over the whole domain: a small
+   chunk run is at most 256 KB so `off < 2^18`, a small slot at most 32 KB so
+   `slotSize <= 2^15`, and the floor is exact whenever `off * slotSize < 2^42`,
+   against an actual bound of `2^33`.
+   On an AMD EPYC 9645, twenty-two paired runs: **1.4% at depth 16 (six of ten
+   pairs) and 0.9% at depth 18 (seven of twelve)** — about 1%, on a box whose
+   run-to-run spread is 10%, so indistinguishable from zero. The premise has
+   simply aged out: Zen 5's integer divider is fast and pipelined, so there is
+   little left for a multiply chain to win. Against that, it was measured
+   *slower* on arm64 (595 ms against 560 ms), and keeping it would trade a real
+   regression on one architecture for a noise-level gain on the other. It also
+   costs eight bytes in every chunk header and an exactness argument that has to
+   stay true.
 
-Of the four ideas in this section, one paid. That is worth stating plainly
+All four ideas in this section have now been measured, and one paid. That is worth stating plainly
 because the list reads like four opportunities and is not: interleaving was
 worth 2.5%, and `NO_SCAN` bits, splitting `SlotMeta` and prefetching were each
 measured on the workload they were supposed to help and were each *negative* on
@@ -179,10 +190,9 @@ way the counters suggested — tgc already misses cache less than druntime's
 collector on the same live set, and these three were all attempts to miss even
 less.
 
-What that leaves is item 8, which needs hardware not in this loop, and the
-observation that the next honest step is not another micro-optimization but a
-regression gate: two of the three rejections above were *plausible*, and nothing
-in CI would have caught them. That is item 11.
+What that leaves is the observation that the next honest step is not another
+micro-optimization but a regression gate: three of these four rejections were
+*plausible*, and nothing in CI would have caught them. That is item 11.
 
 Nothing here blocks tagging 0.2.0. Section C needs help from outside the
 repository.
@@ -358,9 +368,12 @@ Two things this leaves:
   stored per chunk or looked up per size class. M1's divider is fast enough that
   the multiply chain is a longer dependency than the divide it replaces. The
   division is now done in 32 bits instead (a small chunk run is at most 256 KB,
-  so the offset fits), which is free on arm64 and cheaper on x86-64, where the
-  divider is slower. Whether a reciprocal would pay *there* is untested; it
-  would have to be measured on that box before being believed.
+  so the offset fits).
++
+  It has since been re-tried on x86-64, which is where it was supposed to pay,
+  and it does not: about 1% across twenty-two paired runs on an AMD EPYC 9645,
+  inside a 10% run-to-run spread. Zen 5's divider is fast and pipelined, so the
+  assumption that "x86-64's divider is slow" has aged out. See section B item 8.
 * **Skipping the per-slot `TypeInfo` load while marking** (measured on arm64).
   Marking loads
   `meta[idx].ti` per object from a 16-byte-per-slot side array — the coldest
@@ -401,6 +414,7 @@ is close. Six cheap explanations have now been tested:
 | `NO_SCAN` mirrored into those groups | *negative* on bintree, a wash elsewhere |
 | splitting `SlotMeta` into `ti[]` and `usedSize[]` | *negative*, 1.7% over ten pairs |
 | prefetching the directory entry down the scan | *negative*, 2.8% |
+| multiply-by-reciprocal, re-tried on x86-64 | ~1%, inside the noise; still negative on arm64 |
 
 What *did* pay was replacing the hash map with an address-indexed directory
 (shipped) — a candidate outside the heap's span is now rejected in two compares

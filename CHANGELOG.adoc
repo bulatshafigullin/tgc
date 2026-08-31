@@ -637,6 +637,12 @@ commit.
   macOS cannot -- `MADV_HUGEPAGE` and `MADV_DONTNEED` -- and confirms the
   automatic trim there directly in RSS: 112.8 MB to 26.8 MB one collection after
   the drop, against staying at 112.8 MB with it disabled.
+* The last open mark-phase item, re-testing multiply-by-reciprocal on x86-64,
+  measured and rejected there too: about 1% across twenty-two paired runs on an
+  AMD EPYC 9645, inside that box's 10% spread. Zen 5's integer divider is fast
+  and pipelined, so the assumption the item rested on has aged out, and the same
+  change is measurably slower on arm64. All four ideas in that list have now
+  been measured and one paid.
 * Two more mark-phase experiments measured and *not* taken, recorded in
   `IMPROVEMENTS.md` and `BENCHMARKS.md` so they are not tried a third time:
   splitting `SlotMeta` into separate `TypeInfo` and length arrays, which halves

@@ -498,13 +498,44 @@ architecturally a no-op, so they are not needed -- was worse again, with one
 680 ms outlier against a 545 ms norm that looks like page walks for garbage
 addresses.
 
+### Rejected: multiply-by-reciprocal, on the architecture it was meant for
+
+`idx = off / slotSize` sits on the hottest path and `slotSize` is a runtime
+value, so the compiler emits a real divide. It measured slower on arm64 and was
+reverted; the open question was x86-64, where the divider was assumed to be
+slower. It is not, any more.
+
+AMD EPYC 9645 (Zen 5), Debian 13, LDC 1.42.0, statically linked and pinned with
+`taskset` to one core. The box carries an unrelated production load, so runs are
+interleaved and paired, and its own run-to-run spread is about 10%:
+
+| | total pause, mean | pairs won |
+|---|---|---|
+| `bintree 16`, divide | 318.7 ms | |
+| `bintree 16`, reciprocal | 314.2 ms | 6 of 10 |
+| `bintree 18`, divide | 2158.6 ms | |
+| `bintree 18`, reciprocal | 2138.3 ms | 7 of 12 |
+
+About 1%, on a box that cannot resolve 1%, and 13 of 22 pairs is barely above a
+coin toss. Zen 5's integer divider is fast and pipelined; there is little left
+for a multiply chain to win. Since the same change is measurably *slower* on
+arm64 (595 ms against 560 ms), keeping it would trade a real regression on one
+architecture for a noise-level gain on the other.
+
+Note on method: the toolchain will not run on a genuinely idle box that was
+available (Debian 10, glibc 2.28, against the 2.34 that LDC 1.42 and DMD 2.113
+both need), so the benchmarks were built as fully static binaries on the Debian
+13 machine and could have run anywhere. That box turned out to be a 1-vCPU QEMU
+guest with a 23% run-to-run spread -- worse than the loaded 8-core machine
+pinned to a free core -- so the numbers above come from the latter.
+
 ## What is left
 
 Marking is still the top cost, and it is now most of what the collector does:
 the sweep is off the profile and the allocator is no longer faulting pages in a
 loop. What remains is the conservative scan itself and the cache misses
 inherent in chasing pointers through a heap. See `IMPROVEMENTS.md` for the
-explanations already tested and rejected -- four before these passes, ten now,
-of which two paid. Three of the four tried in the latest pass were negative on
+explanations already tested and rejected -- four before these passes, eleven
+now, of which two paid. Three of the four tried in the latest pass were negative on
 arm64, which is itself a result: the mark phase here is not bound by cache lines
 per marked object in the way the counters suggested.
