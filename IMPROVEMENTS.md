@@ -113,25 +113,44 @@ segment work it is 3.2x better on total pause — but on a pure single-threaded
 mark of 256,000 live objects it is still 1.58 ms against 1.16 ms. That gap is
 conservative scanning and the cache lines each marked object touches.
 
-5. **Interleave `allocBits` and `markBits`.** `markPtr` reads one and writes the
-   other for every marked object, and they are separate arrays a few hundred
-   bytes apart — usually two lines. Interleaving them per 64-slot group makes it
-   one. The sweep reads all three bitvectors and would go from three lines to
-   two. Costs a strided loop in `clearMarks` where a `memset` is used today.
-6. **Move `NO_SCAN` into a bitvector.** Marking reads a byte per object out of a
-   byte-per-slot array — 21 cache lines for a 1,300-slot chunk against 3 for the
-   equivalent bits.
+5. ~~**Interleave `allocBits` and `markBits`.**~~ ✅ Done, and it is the smaller
+   of the two numbers it could have been. Per-slot state is now one 4-word group
+   per 64 slots — allocated, marked, promoted, and a spare word so a group
+   divides the cache line and never straddles two — so `markPtr` reads and
+   writes one line where it used to touch two, and the sweep reads one where it
+   read three.
+   Measured on binary-trees, interleaving A-state and B5 runs back to back
+   seven times: **565 ms of total pause to 551 ms, -2.5%**, and B5 won every
+   paired run. Wall time is unchanged, and so are the multi-threaded, region and
+   webserver figures — the win is confined to the workload with a large
+   pointer-chasing live set, which is where the lines were being wasted.
+6. ~~**Move `NO_SCAN` into a bitvector.**~~ ❌ Measured and reverted. The spare
+   word of the group made it free in space, and it still did not pay: on
+   binary-trees it was **0.9% slower** across three paired runs, and on a
+   256,000-block live set of buffers — added as `noScanSweep` in
+   `bench/webserver_probe.d` precisely to give it its best case — it was a wash
+   at 1.84 ms either way.
+   The reasoning behind the item was sound as far as it went (a byte-per-slot
+   array is 21 lines for a 1,300-slot chunk against 3 for bits) and still lost,
+   because the attribute array is not what marking spends its lines on: `attrs`
+   costs one line per 64 slots, while the `SlotMeta` side array costs one per
+   *four*. Against that, mirroring `NO_SCAN` adds a branch to `setAttrOf` on
+   every allocation and a second place for the truth to live. If this is
+   revisited it should be `SlotMeta` that moves, not `attrs` — which is item 4
+   below.
 7. **Prefetch down the mark stack.** Standard for a pointer-chasing collector,
    untried here.
 8. **Re-test multiply-by-reciprocal on x86-64.** It measured *slower* on arm64
    and was reverted; the 32-bit divide that replaced it is cheap there but
    x86-64's divider is not, and that half was never measured.
 
-Expect single-digit percentages each. Items 5 and 6 are the ones with a
-mechanism behind them rather than a hope.
+Expect single-digit percentages each; item 5 delivered 2.5% and item 6 nothing,
+which is the usual hit rate for this list. What is left in it — 7 and 8 — is
+"untried" and "untried on the platform that would show it", not "has a
+mechanism".
 
-Next, and what is left before 0.2.0 can be tagged: nothing in this section.
-Item B is optimization, item C needs help from outside the repository.
+Nothing here blocks tagging 0.2.0. Section C needs help from outside the
+repository.
 
 ### C. Needs someone else
 
@@ -343,6 +362,8 @@ is close. Six cheap explanations have now been tested:
 | free-chunk cache, to cut kernel page management | 0.2% |
 | multiply-by-reciprocal instead of a divide | *negative* on arm64 |
 | per-chunk uniform `TypeInfo`, to skip a cold load | 3.6% upper bound, not taken |
+| interleaving the state bitvectors per 64-slot group | 2.5%, shipped |
+| `NO_SCAN` mirrored into those groups | *negative* on bintree, a wash elsewhere |
 
 What *did* pay was replacing the hash map with an address-indexed directory
 (shipped) — a candidate outside the heap's span is now rejected in two compares
@@ -351,11 +372,12 @@ with no memory touched, and adjacent chunks land on adjacent entries.
 What is left is the conservative scan itself and the cache misses inherent in
 chasing pointers through a large heap. Note the counters say tgc already misses
 cache *less* than druntime's collector on the same live set, so the remaining
-levers are about work done, not about layout:
-interleaving the per-chunk `allocBits`/`markBits`/`sharedBits` so marking touches
-one line instead of two, moving `NO_SCAN` out of the byte-per-slot attribute
-array into a bitvector, and prefetching down the mark stack. All three are worth
-measuring; none is obviously worth its complexity yet.
+levers are about work done, not about layout.
+
+Two of the three layout ideas have now been tried. Interleaving the per-chunk
+state bitvectors so marking touches one line instead of two is worth 2.5% and is
+in. Moving `NO_SCAN` out of the attribute array measured *negative* and is not —
+see section B. Prefetching down the mark stack is still untried.
 
 ### 2. Escape tracking still defaults to off
 

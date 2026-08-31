@@ -85,9 +85,35 @@ void fiberSweep()
     }
 }
 
+/**
+ * Collection time against a live set with nothing in it to scan.
+ *
+ * Buffers and strings, which is the bulk of what a server actually holds, and
+ * the case where marking can stop as soon as it has read the block's NO_SCAN
+ * bit. `liveSetSweep` above is the opposite extreme -- every object scannable
+ * -- so between them they bracket the mark path.
+ */
+void noScanSweep()
+{
+    static ubyte[][] buffers;
+
+    printf("live buffers | collect (ms)\n");
+    foreach (n; [2_000, 8_000, 16_000, 64_000, 256_000])
+    {
+        buffers = new ubyte[][n];
+        foreach (i; 0 .. n)
+            buffers[i] = new ubyte[32];
+        printf("%12d | %.2f\n", n, bestCollectMs());
+        buffers = null;
+        GC.collect();
+    }
+}
+
 void main()
 {
     liveSetSweep();
+    printf("\n");
+    noScanSweep();
     printf("\n");
     fiberSweep();
 }

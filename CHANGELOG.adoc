@@ -364,6 +364,20 @@ collection resets the window: four workers went from 51 ms of total pause to
 145 ms. The peak over a window of *wall time* is the same length however many
 threads are running, and measures nothing on any of the benchmarks.
 
+* *Per-slot state is interleaved rather than kept in parallel arrays.* A chunk's
+  allocated / marked / promoted bits now live in one 4-word group per 64 slots,
+  so `markPtr` -- which reads one and writes another for every object it reaches
+  -- touches one cache line where it used to touch two, and the bulk sweep reads
+  one where it read three. The fourth word is padding, so that a group divides
+  the cache line evenly and none ever straddles two.
++
+Worth 2.5% of total pause on binary-trees (565 ms to 551 ms, winning all seven
+paired runs), and nothing measurable on the multi-threaded, region or webserver
+benchmarks -- the win is confined to a large pointer-chasing live set, which is
+where the lines were being wasted. `clearMarks` gives up its `memset` for a
+strided loop in exchange, which runs once per 64 slots against the mark path's
+once per object.
+
 === Added
 
 * `tgcMinHeap(size_t)` — a floor on a thread's collection threshold, the
@@ -609,6 +623,12 @@ commit.
   segment come back.
 * CI builds `--build=release --d-version=TgcEnforce`, the one configuration
   where the ownership check cannot fall back on the assertion machinery.
+
+* `bench/webserver_probe.d` gained `noScanSweep`: collection time against a live
+  set of buffers rather than of objects, which is the bulk of what a server
+  actually holds and the opposite extreme from the existing sweep. It was added
+  to give a rejected optimization its best case, and is worth keeping for the
+  same reason -- between the two, the mark path is bracketed.
 
 === Fixed — found during this work
 

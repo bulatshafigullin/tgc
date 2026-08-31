@@ -1506,6 +1506,32 @@ private void clearBit(size_t* bits, size_t i) nothrow @nogc
     bits[i / bitsPerWord] &= ~(cast(size_t) 1 << (i % bitsPerWord));
 }
 
+/*
+ * Per-slot state is interleaved, not kept in parallel arrays.
+ *
+ * A chunk's state lives in groups of `wordsPerGroup` words, one group per 64
+ * slots, so a slot's allocated / marked / promoted bits are all in the same
+ * 32 bytes -- and therefore the same cache line. As three separate arrays they
+ * were hundreds of bytes apart, and `markPtr` reads one and writes another for
+ * every object it marks: two lines where one will do. The sweep reads all three
+ * and went from three to one.
+ *
+ * 32 bytes rather than the 24 the three words need, so that a group divides the
+ * cache line evenly and none ever straddles two. The fourth word is spare.
+ */
+private enum size_t wordsPerGroup = 4;
+private enum size_t gAlloc = 0;
+private enum size_t gMark = 1;
+private enum size_t gShared = 2;
+
+static assert((wordsPerGroup * size_t.sizeof) == 32);
+
+/// Words of state a chunk of `n` slots needs.
+private size_t groupWords(size_t n) nothrow @nogc
+{
+    return bitWords(n) * wordsPerGroup;
+}
+
 /**
  * Block attributes actually persisted.
  *
@@ -1563,12 +1589,12 @@ private struct Chunk
     Chunk* prevPartial;
 
     SlotMeta* meta;
-    size_t* allocBits;  /// slot is handed out
-    size_t* markBits;   /// slot was reached this cycle
-    size_t* sharedBits; /// slot escaped through a global (sticky)
-    ubyte* attrs;       /// BlkAttr, one byte per slot
+    /// Interleaved per-slot state: one 4-word group per 64 slots, holding
+    /// allocated, marked and promoted. See `wordsPerGroup`.
+    size_t* bits;
+    ubyte* attrs;    /// BlkAttr, one byte per slot
     void* data;      /// first slot
-    uint nextFree;   /// where to resume searching allocBits for a free slot
+    uint nextFree;   /// where to resume searching for a free slot
 
     uint slotSize;
     uint slotCount;
@@ -1600,15 +1626,26 @@ private struct Chunk
         return isLarge() ? largeSize : slotSize;
     }
 
-    bool isAllocated(size_t i) const nothrow @nogc { return testBit(allocBits, i); }
-    bool isMarked(size_t i) const nothrow @nogc { return testBit(markBits, i); }
-    bool isShared(size_t i) const nothrow @nogc { return testBit(sharedBits, i); }
+    /// Index of the word holding bit `i` of vector `which`.
+    private static size_t at(size_t i, size_t which) nothrow @nogc
+    {
+        return (i / bitsPerWord) * wordsPerGroup + which;
+    }
 
-    void setAllocated(size_t i) nothrow @nogc { setBit(allocBits, i); }
-    void clearAllocated(size_t i) nothrow @nogc { clearBit(allocBits, i); }
-    void setMarked(size_t i) nothrow @nogc { setBit(markBits, i); }
-    void setShared(size_t i) nothrow @nogc { setBit(sharedBits, i); }
-    void clearShared(size_t i) nothrow @nogc { clearBit(sharedBits, i); }
+    private static size_t maskOf(size_t i) nothrow @nogc
+    {
+        return cast(size_t) 1 << (i % bitsPerWord);
+    }
+
+    bool isAllocated(size_t i) const nothrow @nogc { return (bits[at(i, gAlloc)] & maskOf(i)) != 0; }
+    bool isMarked(size_t i) const nothrow @nogc { return (bits[at(i, gMark)] & maskOf(i)) != 0; }
+    bool isShared(size_t i) const nothrow @nogc { return (bits[at(i, gShared)] & maskOf(i)) != 0; }
+
+    void setAllocated(size_t i) nothrow @nogc { bits[at(i, gAlloc)] |= maskOf(i); }
+    void clearAllocated(size_t i) nothrow @nogc { bits[at(i, gAlloc)] &= ~maskOf(i); }
+    void setMarked(size_t i) nothrow @nogc { bits[at(i, gMark)] |= maskOf(i); }
+    void setShared(size_t i) nothrow @nogc { bits[at(i, gShared)] |= maskOf(i); }
+    void clearShared(size_t i) nothrow @nogc { bits[at(i, gShared)] &= ~maskOf(i); }
 
     uint attrOf(size_t i) const nothrow @nogc { return attrs[i]; }
 
@@ -1632,28 +1669,28 @@ private struct Chunk
      */
     size_t firstFree(size_t from) const nothrow @nogc
     {
-        immutable size_t words = bitWords(slotCount);
-        size_t w = from / bitsPerWord;
-        if (w >= words)
+        immutable size_t groups = bitWords(slotCount);
+        size_t g = from / bitsPerWord;
+        if (g >= groups)
             return slotCount;
 
-        size_t bits = ~allocBits[w];
+        size_t w = ~bits[g * wordsPerGroup + gAlloc];
         immutable size_t off = from % bitsPerWord;
         if (off)
-            bits &= ~cast(size_t) 0 << off;
+            w &= ~cast(size_t) 0 << off;
 
         for (;;)
         {
-            if (bits)
+            if (w)
             {
                 import core.bitop : bsf;
 
-                size_t idx = w * bitsPerWord + bsf(bits);
+                size_t idx = g * bitsPerWord + bsf(w);
                 return idx < slotCount ? idx : slotCount;
             }
-            if (++w >= words)
+            if (++g >= groups)
                 return slotCount;
-            bits = ~allocBits[w];
+            w = ~bits[g * wordsPerGroup + gAlloc];
         }
     }
 
@@ -1661,35 +1698,45 @@ private struct Chunk
     /// already proven reachability, so the sticky bit must not veto it.
     size_t nextReclaimableIgnoringShared(size_t from) const nothrow @nogc
     {
-        immutable size_t words = bitWords(slotCount);
-        size_t w = from / bitsPerWord;
-        if (w >= words)
+        immutable size_t groups = bitWords(slotCount);
+        size_t g = from / bitsPerWord;
+        if (g >= groups)
             return slotCount;
 
-        size_t bits = allocBits[w] & ~markBits[w];
+        const(size_t)* grp = bits + g * wordsPerGroup;
+        size_t w = grp[gAlloc] & ~grp[gMark];
         immutable size_t off = from % bitsPerWord;
         if (off)
-            bits &= ~cast(size_t) 0 << off;
+            w &= ~cast(size_t) 0 << off;
 
         for (;;)
         {
-            if (bits)
+            if (w)
             {
                 import core.bitop : bsf;
 
-                size_t idx = w * bitsPerWord + bsf(bits);
+                size_t idx = g * bitsPerWord + bsf(w);
                 return idx < slotCount ? idx : slotCount;
             }
-            if (++w >= words)
+            if (++g >= groups)
                 return slotCount;
-            bits = allocBits[w] & ~markBits[w];
+            grp = bits + g * wordsPerGroup;
+            w = grp[gAlloc] & ~grp[gMark];
         }
     }
 
-    /// Clear every mark in one sweep over n/8 bytes.
+    /**
+     * Clear every mark.
+     *
+     * A strided loop rather than the `memset` the parallel-array layout
+     * allowed: interleaving trades this for one line per marked object on the
+     * mark path, which runs per *object* where this runs per 64 slots.
+     */
     void clearMarks() nothrow @nogc
     {
-        memset(markBits, 0, bitWords(slotCount) * size_t.sizeof);
+        immutable size_t groups = bitWords(slotCount);
+        foreach (g; 0 .. groups)
+            bits[g * wordsPerGroup + gMark] = 0;
     }
 
     /**
@@ -1701,28 +1748,31 @@ private struct Chunk
      */
     size_t nextReclaimable(size_t from) const nothrow @nogc
     {
-        immutable size_t words = bitWords(slotCount);
-        size_t w = from / bitsPerWord;
-        if (w >= words)
+        immutable size_t groups = bitWords(slotCount);
+        size_t g = from / bitsPerWord;
+        if (g >= groups)
             return slotCount;
 
-        size_t bits = allocBits[w] & ~markBits[w] & ~sharedBits[w];
+        const(size_t)* grp = bits + g * wordsPerGroup;
+        size_t w = grp[gAlloc] & ~grp[gMark] & ~grp[gShared];
+        // Mask off slots before `from` in the first group.
         immutable size_t off = from % bitsPerWord;
         if (off)
-            bits &= ~cast(size_t) 0 << off;
+            w &= ~cast(size_t) 0 << off;
 
         for (;;)
         {
-            if (bits)
+            if (w)
             {
                 import core.bitop : bsf;
 
-                size_t idx = w * bitsPerWord + bsf(bits);
+                size_t idx = g * bitsPerWord + bsf(w);
                 return idx < slotCount ? idx : slotCount;
             }
-            if (++w >= words)
+            if (++g >= groups)
                 return slotCount;
-            bits = allocBits[w] & ~markBits[w] & ~sharedBits[w];
+            grp = bits + g * wordsPerGroup;
+            w = grp[gAlloc] & ~grp[gMark] & ~grp[gShared];
         }
     }
 }
@@ -2171,16 +2221,17 @@ private struct ThreadHeap
         memset(raw, 0, Chunk.sizeof);
 
         auto c = cast(Chunk*) raw;
-        immutable size_t bitsOff = alignUp(Chunk.sizeof, size_t.sizeof);
+        // Cache-line aligned, so that no state group straddles a line -- which
+        // is the entire reason the groups are padded to 32 bytes.
+        immutable size_t bitsOff = alignUp(Chunk.sizeof, cacheLine);
 
-        size_t count = (bytes - bitsOff) * 8 / (slotSize * 8 + SlotMeta.sizeof * 8 + 8 + 3);
-        size_t dataOff, metaOff, attrOff, markOff, sharedOff;
+        // Per slot: SlotMeta, one attribute byte, and four bits of state.
+        // Solve for the count that fits, then lay the regions out in order.
+        size_t count = (bytes - bitsOff) * 8 / (slotSize * 8 + SlotMeta.sizeof * 8 + 8 + wordsPerGroup);
+        size_t dataOff, metaOff, attrOff;
         for (;;)
         {
-            immutable size_t bw = bitWords(count) * size_t.sizeof;
-            markOff = bitsOff + bw;
-            sharedOff = markOff + bw;
-            attrOff = sharedOff + bw;
+            attrOff = bitsOff + groupWords(count) * size_t.sizeof;
             metaOff = alignUp(attrOff + count, size_t.sizeof);
             dataOff = alignUp(metaOff + count * SlotMeta.sizeof, payloadAlign);
             if (count == 0 || dataOff + count * slotSize <= bytes)
@@ -2190,9 +2241,7 @@ private struct ThreadHeap
         assert(count > 0, "tgc: chunk too small for its size class");
 
         c.heap = &this;
-        c.allocBits = cast(size_t*)(cast(ubyte*) raw + bitsOff);
-        c.markBits = cast(size_t*)(cast(ubyte*) raw + markOff);
-        c.sharedBits = cast(size_t*)(cast(ubyte*) raw + sharedOff);
+        c.bits = cast(size_t*)(cast(ubyte*) raw + bitsOff);
         c.attrs = cast(ubyte*)(cast(ubyte*) raw + attrOff);
         c.meta = cast(SlotMeta*)(cast(ubyte*) raw + metaOff);
         c.data = cast(void*)(cast(ubyte*) raw + dataOff);
@@ -2222,10 +2271,10 @@ private struct ThreadHeap
 
     Chunk* newLargeChunk(size_t size, Region* region) nothrow @nogc
     {
-        immutable size_t bitsOff = alignUp(Chunk.sizeof, size_t.sizeof);
-        immutable size_t markOff = bitsOff + size_t.sizeof;
-        immutable size_t sharedOff = markOff + size_t.sizeof;
-        immutable size_t attrOff = sharedOff + size_t.sizeof;
+        // A large chunk holds exactly one slot, so a single state group and one
+        // attribute byte suffice.
+        immutable size_t bitsOff = alignUp(Chunk.sizeof, cacheLine);
+        immutable size_t attrOff = bitsOff + wordsPerGroup * size_t.sizeof;
         immutable size_t metaOff = alignUp(attrOff + 1, size_t.sizeof);
         immutable size_t dataOff = alignUp(metaOff + SlotMeta.sizeof, payloadAlign);
 
@@ -2241,9 +2290,7 @@ private struct ThreadHeap
 
         auto c = cast(Chunk*) raw;
         c.heap = &this;
-        c.allocBits = cast(size_t*)(cast(ubyte*) raw + bitsOff);
-        c.markBits = cast(size_t*)(cast(ubyte*) raw + markOff);
-        c.sharedBits = cast(size_t*)(cast(ubyte*) raw + sharedOff);
+        c.bits = cast(size_t*)(cast(ubyte*) raw + bitsOff);
         c.attrs = cast(ubyte*)(cast(ubyte*) raw + attrOff);
         c.meta = cast(SlotMeta*)(cast(ubyte*) raw + metaOff);
         c.data = cast(void*)(cast(ubyte*) raw + dataOff);
@@ -2516,19 +2563,22 @@ private struct ThreadHeap
     {
         import core.bitop : bsf, popcnt;
 
-        immutable size_t words = bitWords(c.slotCount);
+        immutable size_t groups = bitWords(c.slotCount);
         size_t freed = 0;
         size_t firstDead = size_t.max;
 
-        foreach (w; 0 .. words)
+        foreach (g; 0 .. groups)
         {
-            immutable size_t dead = c.allocBits[w] & ~c.markBits[w] & ~c.sharedBits[w];
+            // Promoted slots are excluded, exactly as nextReclaimable does:
+            // only a global collection can prove no other thread holds them.
+            auto grp = c.bits + g * wordsPerGroup;
+            immutable size_t dead = grp[gAlloc] & ~grp[gMark] & ~grp[gShared];
             if (!dead)
                 continue;
-            c.allocBits[w] &= ~dead;
+            grp[gAlloc] &= ~dead;
             freed += popcnt(dead);
             if (firstDead == size_t.max)
-                firstDead = w * bitsPerWord + bsf(dead);
+                firstDead = g * bitsPerWord + bsf(dead);
         }
 
         if (freed == 0)

@@ -410,11 +410,48 @@ what the heap holds at the end of a collection reads it at its trough and cost
 The reservation itself costs 16 ms and touches all 256 MB, which is more than
 this workload goes on to use. It is a latency trade, not a throughput one.
 
+## Interleaved per-slot state — macOS/arm64
+
+A chunk's allocated / marked / promoted bits moved from three parallel arrays
+into one 4-word group per 64 slots. Runs are interleaved -- one build, then the
+other, repeated -- rather than batched, because the machine drifts by more than
+the effect being measured over the course of a session.
+
+`bintree 18`, seven paired runs:
+
+| | total pause | max pause | wall |
+|---|---|---|---|
+| separate arrays | 558–572 ms (mean 565) | 15.8–17.3 ms | 1.41–1.44 s |
+| interleaved | 548–560 ms (mean 551) | 15.5–16.2 ms | 1.39–1.43 s |
+
+-2.5% on total pause, and the interleaved build won every paired run.
+`bintree_mt 18 4`, `bintree_region 18 4` and `bench-webserver` are unchanged
+within noise: the win needs a large pointer-chasing live set, which is the only
+one of the four that has one.
+
+### Rejected: `NO_SCAN` in a bitvector
+
+Mirroring `NO_SCAN` into the group's spare word — free in space, since the
+padding was there anyway — so that marking never reads the byte-per-slot
+attribute array:
+
+| | total pause |
+|---|---|
+| `bintree 18`, without | 530–544 ms (mean 537) |
+| `bintree 18`, with | 537–546 ms (mean 542) |
+
+0.9% *slower*, three paired runs, and a wash on `noScanSweep` at 256,000 live
+buffers (1.84 ms either way) — the case constructed to give it its best showing.
+Reverted. The premise was right about the attribute array being 21 lines per
+1,300-slot chunk against 3 for bits; it was wrong about that mattering, because
+`attrs` costs one line per 64 slots while the `SlotMeta` side array costs one per
+four.
+
 ## What is left
 
 Marking is still the top cost, and it is now most of what the collector does:
 the sweep is off the profile and the allocator is no longer faulting pages in a
 loop. What remains is the conservative scan itself and the cache misses
 inherent in chasing pointers through a heap. See `IMPROVEMENTS.md` for the
-explanations already tested and rejected -- four before these two passes, six
-now.
+explanations already tested and rejected -- four before these passes, eight now,
+of which two paid.
