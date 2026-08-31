@@ -119,10 +119,15 @@ its arena when the child exited. The parent then catches a **destructed object
 in freed memory**. It reads correctly only because nothing has reused the pages
 yet.
 
-This matters for how the project describes itself. Cross-thread sharing is
-currently documented as "unsupported in v1" — but this is not user code
-violating a documented restriction, it is `core.thread`'s contract. "Don't share
-between threads" is not a restriction a D program can actually honour.
+This matters for how the project describes itself. Cross-thread sharing was
+documented as "unsupported in v1" — but this is not user code violating a
+documented restriction, it is `core.thread`'s contract. "Don't share between
+threads" is not a restriction a D program can actually honour.
+
+> **Since fixed (Phase 0).** A dying thread's arenas are no longer finalized and
+> freed; they are adopted by a heap no thread-local collection sweeps, so the
+> object `join()` hands the parent stays valid. A cooperative global collection
+> reclaims them later.
 
 ### 2.3 `shared` and `immutable` data still lives on the allocating thread's heap
 
@@ -359,12 +364,24 @@ path.
 
 ## 6. Honest summary for the README
 
-The present "cross-thread sharing is unsupported in v1" wording implies a
-restriction users can comply with. They cannot: `Thread`, its closure, and
-`join()`'s exception propagation all cross heaps by construction, and §2.2 is a
+*Written before any of the phases landed; kept because the reasoning is what
+produced them. See the box at the top of this file for where it ended up.*
+
+The "cross-thread sharing is unsupported in v1" wording implied a restriction
+users can comply with. They cannot: `Thread`, its closure, and `join()`'s
+exception propagation all cross heaps by construction, and §2.2 is a
 use-after-free in ordinary code. Until Phase 0 lands, the accurate statement is
 that tgc is sound only for single-threaded programs, or for threads that never
 throw and are never joined.
+
+**Where it stands now.** Phase 0 (arenas of exited threads retained), Phase 1
+(opt-in escape promotion, `tgcTrackEscapes`) and Phase 2 (cooperative global
+collection) have all landed, and the transfer path has been removed rather than
+made safe. The accurate statement today is the one in the README: heaps are
+strictly thread-private, a block belongs to the thread that allocated it, the
+constructs that cross heaps by construction are handled, and passing a block
+across threads yourself is detected in a non-release build instead of corrupting
+memory later.
 
 ---
 

@@ -20,3 +20,4 @@ dub.selections.json
 /bench-mt
 /bench-region
 /bench/results/
+/bench-webserver

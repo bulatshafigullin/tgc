@@ -27,17 +27,103 @@ Infrastructure: UTF-8 conversion, `.gitattributes`, CI (DMD/LDC ×
 Linux/macOS/Windows + sanitizers + encoding guard), adversarial test suite,
 optimized test build, **in-repo benchmarks** (`bench/run.sh`).
 
-Measured collection time, N live 32-byte objects:
+Measured collection time, N live 32-byte objects, macOS/arm64. The last column
+is the current collector, reproducible with `bench/webserver_probe.d`; the first
+two are from the original audit's probes.
 
-| live objects | before | after |
-|---|---|---|
-| 2,000 | 21 ms | 0.05 ms |
-| 8,000 | 176 ms | 0.09 ms |
-| 16,000 | **577 ms** | **0.15 ms** |
-| 64,000 | — | 0.46 ms |
-| 256,000 | — | 1.83 ms |
+| live objects | before | after the allocator | now |
+|---|---|---|---|
+| 2,000 | 21 ms | 0.05 ms | 0.03 ms |
+| 8,000 | 176 ms | 0.09 ms | 0.06 ms |
+| 16,000 | **577 ms** | 0.15 ms | **0.09 ms** |
+| 64,000 | — | 0.46 ms | 0.30 ms |
+| 256,000 | — | 1.83 ms | **1.15 ms** |
 
-Quadratic → linear. Appending 100,000 elements: 100,000 reallocations → 13.
+Quadratic → linear, then another 37% from the mark, sweep and allocator work.
+Appending 100,000 elements: 100,000 reallocations → 13.
+
+---
+
+## Next — a plan, in the order worth doing it
+
+Ranked by what a user would notice, not by what is most interesting. Every item
+below is measurable with what is now in the repository (`bench/run.sh`,
+`bench/webserver_probe.d`), which is the standard the last two passes were held
+to and the reason two of their four "obvious" optimizations were reverted.
+
+### A. Before calling it 0.2.0
+
+1. **Return memory without being asked.** The segment allocator only gives
+   memory back on `GC.minimize()`, so a server that never calls it holds its
+   peak for the life of the process. That is a surprising default and the most
+   likely thing to be reported as a leak. Proposal: during a collection, when a
+   segment falls below some occupancy, hand back its free 2 MB spans — the
+   machinery already exists, only the trigger is missing. Needs hysteresis so a
+   breathing heap does not thrash, and measuring on both RSS and pause.
+2. **Keep the thread-private checks in release builds, optionally.** They are
+   asserts, so `-release` is back to the old silent behaviour. A
+   `version(TgcEnforce)` that keeps them costs two atomic loads on a cold path
+   and turns a development aid into a guarantee for anyone who wants it.
+3. **`reserve()` still returns 0.** Trivial now that chunks come from segments:
+   pre-map and pre-touch, so a latency-sensitive caller pays the page faults up
+   front instead of inside its first request. Small, and directly useful to the
+   audience this collector is for.
+4. **Shutdown leak.** `ThreadGC` is `malloc`'d and never destroyed, and a heap's
+   root/range snapshot buffers leak with it — LeakSanitizer reports 1056 bytes.
+   Harmless, but it is why the ASan job runs with `detect_leaks=0`, and fixing
+   it lets that flag come off.
+
+### B. Performance: the mark phase, which is now all that is left
+
+The counters say what to expect. On a matched budget tgc executes the same
+instructions as the default collector and misses cache *less*, and after the
+segment work it is 3.2x better on total pause — but on a pure single-threaded
+mark of 256,000 live objects it is still 1.58 ms against 1.16 ms. That gap is
+conservative scanning and the cache lines each marked object touches.
+
+5. **Interleave `allocBits` and `markBits`.** `markPtr` reads one and writes the
+   other for every marked object, and they are separate arrays a few hundred
+   bytes apart — usually two lines. Interleaving them per 64-slot group makes it
+   one. The sweep reads all three bitvectors and would go from three lines to
+   two. Costs a strided loop in `clearMarks` where a `memset` is used today.
+6. **Move `NO_SCAN` into a bitvector.** Marking reads a byte per object out of a
+   byte-per-slot array — 21 cache lines for a 1,300-slot chunk against 3 for the
+   equivalent bits.
+7. **Prefetch down the mark stack.** Standard for a pointer-chasing collector,
+   untried here.
+8. **Re-test multiply-by-reciprocal on x86-64.** It measured *slower* on arm64
+   and was reverted; the 32-bit divide that replaced it is cheap there but
+   x86-64's divider is not, and that half was never measured.
+
+Expect single-digit percentages each. Items 5 and 6 are the ones with a
+mechanism behind them rather than a hope.
+
+### C. Needs someone else
+
+9. **Fiber enumeration is O(all fibers in the process)** (item 4b). Scanning is
+   already restricted to a thread's own fibers; enumeration cannot be, because
+   druntime's context list is the only authority on whether a stack is still
+   mapped. Fixing it needs a `ThreadBase` field recording the owning thread on
+   each `StackContext`, or a per-thread context list. Worth raising upstream
+   alongside the tgc PR.
+10. **Escape tracking as the default** (item 2). Now that a global collection is
+    cheap, the question is whether tying local pause growth to the global
+    interval is acceptable on a realistic workload. Needs measurement before it
+    can be argued either way, and it is the difference between "unsupported" and
+    "handled" for the publish-to-a-global pattern.
+11. **Benchmarks in CI** (item 7). Nothing fails today when a change makes the
+    mark phase slower. Pause per collection on a fixed live set is the most
+    stable thing to gate on; a shared runner's wall clock is not.
+
+### Not planned, and why
+
+* **Parallel marking within a collection.** It would cut one thread's pause, but
+  by stealing cores from the threads whose independence is the entire argument
+  for this collector.
+* **Precise or moving collection.** Both need compiler support D does not have;
+  the same barrier problem that bounds `CROSS-THREAD.md`'s conclusions.
+* **A second ownership model** (pinned cross-thread transfer). Considered and
+  rejected — see item 1.
 
 ---
 

@@ -182,7 +182,8 @@ conditional on that.
 * *Benchmarks are in the repository.* `dub build -c bench-bintree|bench-mt|bench-region`
   and `bench/run.sh` build the three binary-trees variants and run each under
   both collectors, reporting wall time, collections and pause distribution.
-  See `BENCHMARKS.md`.
+  `bench-webserver` adds the two probes `WEBSERVER.md` quotes -- collection time
+  against live set, and against suspended fibers. See `BENCHMARKS.md`.
 
 * *Precise scanning via `TypeInfo.rtInfo` pointer maps* (`tgcPreciseScanning`,
   on by default). Marking consults the compiler-emitted map for a block and

@@ -1,7 +1,10 @@
 # Using tgc for a threads + fibers web server
 
 Design note. Claims marked **[measured]** come from probes run against this
-repository's collector with LDC 1.42.0 on macOS/aarch64.
+repository's collector with LDC 1.42.0. Figures were re-measured after the
+mark, sweep and allocator work; the reproducible ones come from
+`bench/webserver_probe.d` (`dub run --config=bench-webserver`) and
+`bench/run.sh`, on Linux/x86-64 unless noted.
 
 Target architecture from the question: N worker threads (≈ CPU count), many
 fibers per thread, an acceptor handing each new connection to a fiber.
@@ -69,26 +72,39 @@ ever marks blocks in the scanning thread's own heap, so it errs toward retention
 
 ### What it costs [measured]
 
-Collection time with 50,000 live objects, as suspended fibers accumulate:
+Collection time with 50,000 live objects, as suspended fibers accumulate.
+`bench/webserver_probe.d`, one thread, both collectors on the same binary:
 
-| suspended fibers | collect |
-|---|---|
-| 0 | 0.32 ms |
-| 100 | 0.36 ms |
-| 1,000 | 0.64 ms |
-| 5,000 | 2.16 ms |
-| 10,000 | 3.55 ms |
+| suspended fibers | tgc | default collector |
+|---|---|---|
+| 0 | 0.32 ms | 0.23 ms |
+| 100 | 0.33 ms | 0.25 ms |
+| 1,000 | 0.48 ms | 0.34 ms |
+| 5,000 | 1.15 ms | 1.38 ms |
+| 10,000 | **2.18 ms** | 3.77 ms |
 
-Roughly 0.32 µs per suspended fiber, linear. For a server holding 10k concurrent
-connections as fibers, budget ~3.5 ms per collection on that thread — still only
-that thread, while the others keep serving.
+Roughly 0.19 µs per suspended fiber, linear — and *cheaper* than the default
+collector past a few thousand fibers, which is the shape a connection-per-fiber
+server lives in. The difference that matters is not in the table: tgc's 2.18 ms
+pauses one thread, the default collector's 3.77 ms pauses all of them.
 
-**Remaining limitation.** druntime's context list is global and records no
-fiber-to-thread affinity, so each thread currently scans *every* thread's
-fibers. With 4 threads × 2,500 fibers each, all four do the full 10,000-fiber
-scan instead of their own 2,500. That is roughly 4× more scanning than
-necessary; fixing it needs tgc to track affinity itself. Keep it in mind when
-sizing threads: many threads each with many fibers multiplies this cost.
+For a server holding 10k concurrent connections as fibers on one thread, budget
+a bit over 2 ms per collection on that thread.
+
+**Remaining limitation, smaller than it was.** Fiber *scanning* is now
+restricted to the collecting thread's own fibers: a context counts as ours only
+if this heap owns the `StackContext` block, which `Fiber` allocates with `new`
+on its creating thread. What is still global is *enumeration* — finding those
+contexts means walking druntime's list of every fiber in the process, and the
+ownership test has to happen inside druntime's thread lock, because once it is
+released another thread may destroy its fiber and unmap the stack.
+
+Measured (before the mark and sweep work, so read the shape rather than the
+absolute values) with each thread holding a constant 400 fibers, so all growth
+comes from *other* threads' fibers: 0.20 ms at one thread, 0.29 ms at eight.
+Real, but an order of magnitude smaller than the "4× more scanning" this section
+used to describe. Removing it needs a druntime field recording the owning thread on each
+`StackContext`.
 
 ---
 
@@ -141,6 +157,14 @@ with per-thread heaps.
 
 What you must **not** do is `auto c = new Connection(fd); queue.push(c);` — that
 is the unsound transfer.
+
+Since the collector became strictly thread-private, that mistake is also
+*detected* rather than silent: `GC.free`, `realloc`, `setAttr` and the
+array-mutating calls assert when handed a block from another thread's heap. The
+checks are asserts, so they are live in a debug or default build and compiled
+out under `-release`. Run your integration tests without `-release` at least
+once; a wrong answer that used to surface as corruption weeks later now surfaces
+as an assertion at the point of the mistake.
 
 ---
 
@@ -206,10 +230,21 @@ call `tgcCollectGlobal()` yourself at a quiet moment.
 ## 3c. Per-request regions
 
 `tgcBeginRegion` / `tgcEndRegion` give a request its own arena: everything the
-handler allocates is released when the region closes, without tracing. Measured
-on a handler loop of 4000 requests allocating 200 blocks each, that took
-collections during the run from 799 to zero, and the loop from 58.5 ms to
-36.3 ms.
+handler allocates is released when the region closes, without tracing. This is
+the single biggest lever in this document.
+
+Measured with `bench/run.sh -b region`, four workers, the same workload with and
+without regions — a job stands in for a request, and the only thing outliving it
+is an `int` copied out:
+
+| | collections | total pause | max pause | parallel section |
+|---|---|---|---|---|
+| without regions | 4,987 | 866.6 ms | 32.1 ms | 0.561 s |
+| **with regions** | **5** | **56.8 ms** | 27.9 ms | **0.358 s** |
+
+Same 25 MB heap either way. Request-scoped memory never enters the mark phase at
+all, so the only collections left are the ones that handle genuinely long-lived
+data.
 
 ```d
 void handleRequest(int fd)
@@ -236,12 +271,21 @@ something.
 ## 4. Per-request allocation: play to tgc's strength
 
 The reason to want tgc here is tail latency: a collection pauses one thread's
-fibers, not the whole process, and it scans only that thread's live set. With the
-arena allocator this repository now has, a collection over 256,000 live objects
-takes **1.83 ms** [measured], and scales linearly — so a worker holding ~50k live
-objects pauses for a few hundred microseconds, while the other workers keep
-serving. That is a genuinely good story for p99 latency, and it is the thing the
-default global-STW collector cannot give you.
+fibers, not the whole process, and it scans only that thread's live set.
+`bench/webserver_probe.d`, one thread, no fibers:
+
+| live objects | collect |
+|---|---|
+| 2,000 | 0.04 ms |
+| 16,000 | 0.12 ms |
+| 64,000 | 0.40 ms |
+| 256,000 | **1.58 ms** |
+
+Linear, so a worker holding ~50k live objects pauses for roughly a third of a
+millisecond while the other workers keep serving. That is the thing the default
+global-STW collector cannot give you, and the gap widens with worker count: at
+four workers on binary-trees the default collector spends 778 ms of pause
+against tgc's 125 ms, and its worst pause is 154 ms against 24 ms.
 
 To keep it that way:
 
@@ -253,28 +297,60 @@ To keep it that way:
   scratch. tgc's per-thread heap makes a per-request bump allocator natural, and
   anything you do not hand to the GC is not scanned.
 
----
+### 4a. Size the heap, or you will collect constantly
 
-## 5. Interim mitigation for fibers, if you must experiment before the fix
+tgc sizes each thread's heap from its own live data, which for a small live set
+means collecting very often. `tgcMinHeap(bytes)` is the floor, and it is **per
+thread** — the equivalent of the default collector's `minPoolSize`, divided by
+your worker count.
 
-Root each fiber's live state somewhere tgc *does* scan — thread-local storage:
+It is worth more than it looks. On binary-trees at four workers, sizing from
+live data cost 4,983 collections; the same run with a matched budget took 27.
+Give each worker a floor that comfortably exceeds its steady-state live set:
 
 ```d
-Connection[size_t] active;    // TLS: scanned by this thread's collector
-
-void handle(int fd)
-{
-    auto conn = new Connection(fd);
-    active[conn.id] = conn;          // now reachable from TLS, not just the fiber stack
-    scope(exit) active.remove(conn.id);
-    ...
-}
+tgcMinHeap(totalHeapBudget / workerCount);   // before starting the workers
 ```
 
-This keeps the connection object alive across yields regardless of fiber-stack
-scanning. It does **not** protect arbitrary intermediate objects held in fiber
-locals across a yield, so treat it as a workaround for a demo, not a production
-strategy.
+Pause time is proportional to *live* data, not to the heap, so headroom costs
+memory and buys both throughput and latency.
+
+---
+
+## 5. Memory: segments, huge pages, and when memory goes back
+
+This section replaces an interim workaround for unscanned fiber stacks, which is
+no longer needed — §0 shipped.
+
+Chunks are carved from large mappings rather than allocated one at a time, which
+on Linux lets the kernel back the heap with huge pages. That is worth an order
+of magnitude: on binary-trees at a matched budget it took page faults from
+926,000 to 210,000 and total pause from 374 ms to 38 ms. Nothing is required of
+you to get it.
+
+What *is* required of you is deciding when memory goes back. Freed chunks stay
+in their segment, and empty segments are kept — bounded to a quarter of what is
+mapped, plus one — because unmapping memory a growing heap is about to ask for
+again is the page fault this design exists to avoid. Nothing returns it
+automatically.
+
+For a server that means: after a traffic spike drains, the peak stays mapped
+until you ask.
+
+```d
+// on an idle tick, or after a burst subsides
+GC.minimize();   // unmaps empty segments, and hands back every 2 MB span
+                 // inside a segment that holds nothing
+```
+
+`tgcCommittedBytes()` reports what is currently backed by memory, so a health
+endpoint can watch it. `tgcSegmentSize(bytes)` tunes the granularity: larger
+segments mean fewer mappings and less churn, smaller ones return memory at a
+finer grain. The default is 32 MB.
+
+One caveat worth knowing before you tune it down: a segment is only unmapped
+when *every* chunk in it is free, so one long-lived object can pin one. The 2 MB
+span-level release inside `GC.minimize()` is what covers that case.
 
 ---
 
@@ -283,14 +359,23 @@ strategy.
 | | status |
 |---|---|
 | Per-thread heaps for a shared-nothing worker model | good fit, this is the intended shape |
-| Pause behaviour vs. the default GC | genuinely better: 1.83 ms for 256k live objects, one thread only |
-| Fibers | **broken today** — fiber stacks unscanned; fixable in tgc as in §0 |
-| Acceptor handing objects to workers | unsound; redesign per §1 |
-| Shared `immutable` config via `__gshared` | works today [measured] |
-| Thread shutdown (`join` after a throw) | use-after-free, see `CROSS-THREAD.md` §2.2 |
+| Pause behaviour vs. the default GC | better, and the gap widens with workers: at four, 125 ms of pause against 778 ms, worst pause 24 ms against 154 ms |
+| Fibers | **works** — every registered stack context is scanned, and only this thread's (§0) |
+| Acceptor handing objects to workers | unsound; redesign per §1. Now asserts in a non-release build instead of failing silently |
+| Shared `immutable` config via `__gshared` | works [measured] |
+| Thread shutdown (`join` after a throw) | fixed: a dying thread's arenas are retained, and reclaimed by a global collection |
+| Per-request regions | the biggest lever here: 4,987 collections to 5, 867 ms of pause to 57 ms (§3c) |
+| Returning memory to the OS | your call, via `GC.minimize()` (§5) |
 
 **Recommendation.** The architecture is right for tgc if you make two changes:
 accept per-thread with `SO_REUSEPORT` instead of handing connections across
-threads, and pin fibers to their thread. But do not build on tgc until fiber
-stack scanning (§0) and the thread-teardown use-after-free are fixed — both are
-tractable and neither needs a language change.
+threads, and pin fibers to their thread. The two blockers this document used to
+end on — unscanned fiber stacks and the thread-teardown use-after-free — are
+both fixed, so the honest advice is now: build on it, with regions for
+per-request memory, a `tgcMinHeap` floor per worker, and your integration tests
+running without `-release` so the thread-private checks are live.
+
+What is still true and worth planning around: marking is conservative and is now
+the collector's dominant cost, so per-thread live set is the number that governs
+your pause time; and nothing returns memory to the OS unless you call
+`GC.minimize()`.

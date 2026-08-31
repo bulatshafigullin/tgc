@@ -75,3 +75,13 @@ configuration "bench-region" {
     sourceFiles "bintree_region.d"
     mainSourceFile "bintree_region.d"
 }
+
+// The probes behind WEBSERVER.md: collection time against live set, and
+// against suspended fibers.
+configuration "bench-webserver" {
+    targetType "executable"
+    targetName "bench-webserver"
+    sourcePaths "source"
+    sourceFiles "bench/webserver_probe.d"
+    mainSourceFile "bench/webserver_probe.d"
+}
