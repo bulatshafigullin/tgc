@@ -147,6 +147,49 @@ private StackContext* globalStackContexts() nothrow @nogc
 }
 
 /**
+ * Head of this thread's *own* stack-context list, when druntime has one.
+ *
+ * Without it, finding a thread's fibers means walking `ThreadBase.sm_cbeg`,
+ * which holds every context in the process, so a collection walks T x F
+ * contexts to scan its own F. The ownership test cannot be hoisted out of
+ * druntime's thread lock either: release it and another thread may destroy its
+ * fiber and unmap the stack that was about to be scanned.
+ *
+ * `StackContext.owner` and `StackContext.nextInThread` are a two-field addition
+ * to druntime that threads each thread's contexts onto its own list alongside
+ * the global one, maintained in the same `add`/`remove` under the same lock.
+ * Prototyped against a patched druntime and measured; see IMPROVEMENTS.md.
+ * Until it exists upstream this returns null and the global walk is used, so
+ * the collector is correct either way and simply does more work.
+ */
+private StackContext* ownedStackContexts(ThreadBase t) nothrow @nogc
+{
+    static if (__traits(compiles, __traits(getMember, ThreadBase, "m_cbeg")))
+    {
+        if (t is null)
+            return null;
+        return cast(StackContext*) __traits(getMember, t, "m_cbeg");
+    }
+    else
+        return null;
+}
+
+/// Whether this druntime can enumerate a thread's own contexts directly.
+private enum bool hasPerThreadContexts =
+    __traits(compiles, __traits(getMember, ThreadBase, "m_cbeg"));
+
+/// Step to the next context, along this thread's own list when there is one.
+/// The field access has to sit behind the `static if` or it fails to compile
+/// against a druntime that does not have it.
+private StackContext* nextContext(StackContext* c, bool perThread) nothrow @nogc
+{
+    static if (hasPerThreadContexts)
+        return perThread ? c.nextInThread : c.next;
+    else
+        return c.next;
+}
+
+/**
  * druntime's lock guarding the global thread and stack-context lists.
  *
  * Taking it during a collection follows druntime's own documented lock order —
@@ -4320,8 +4363,15 @@ private:
         // is known to belong to this thread is it safe to use its stack bounds
         // later: any other thread's fiber may be destroyed and its stack
         // unmapped the moment the lock is released, and scanning that faults.
+        // Where the walk starts, and how it advances, is the only difference
+        // between the two paths: the filtering below is identical, because a
+        // per-thread list is a subset of the global one and every test still
+        // has to hold.
+        auto own = ownedStackContexts(ThreadBase.getThis());
+        immutable bool perThread = own !is null;
         size_t n = 0;
-        for (auto c = globalStackContexts(); c; c = c.next)
+        for (auto c = perThread ? own : globalStackContexts(); c;
+             c = nextContext(c, perThread))
         {
             // A fiber that has not started, or has finished, has
             // tstack == bstack and contributes nothing. Cheapest test first.
@@ -4330,6 +4380,16 @@ private:
 
             // Ours only if this heap owns the StackContext block itself —
             // `Fiber` allocates it with `new` on its creating thread.
+            //
+            // Kept on the per-thread path too, even though that list is
+            // already restricted to this thread. The two notions of ownership
+            // are *not* the same: a thread's own `m_main` context is a field
+            // inside its `ThreadBase`, which some other thread allocated, so it
+            // is on this thread's list and is not a block this heap owns.
+            // Asserting they agreed deadlocked the whole process -- the
+            // AssertError propagated out of this function with druntime's
+            // thread lock held, and every thread trying to register itself
+            // blocked on it forever.
             if (!heap.lookup(cast(void*) c, false).valid())
                 continue;
 

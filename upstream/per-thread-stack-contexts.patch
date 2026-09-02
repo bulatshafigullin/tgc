@@ -1,0 +1,98 @@
+--- a/druntime/src/core/thread/context.d
++++ b/druntime/src/core/thread/context.d
+@@ -11,6 +11,8 @@
+ 
+ module core.thread.context;
+ 
++import core.thread.threadbase : ThreadBase;
++
+ // LDC: Unconditionally change ABI to support sanitizers
+ version (LDC) version = SupportSanitizers_ABI;
+ 
+@@ -24,6 +26,27 @@
+     void* ehContext;
+     StackContext* within;
+     StackContext* next, prev;
++
++    /**
++     * The thread this context belongs to, and the next context belonging to
++     * the same thread.
++     *
++     * `next`/`prev` thread every context in the process onto a single list,
++     * which is the only thing a collector has to walk. A collector that scans
++     * only its own thread's stacks -- a thread-local one -- therefore walks
++     * T x F contexts to reach its own F, and cannot do better today: the
++     * ownership test has to happen inside `ThreadBase.slock`, because once
++     * that is released another thread may destroy its fiber and unmap the
++     * stack it was about to scan.
++     *
++     * These two fields let such a collector start from its own `ThreadBase`
++     * and visit only its own contexts. They cost a pointer store in `add` and
++     * a short walk in `remove`, both once per context lifetime rather than
++     * once per collection.
++     */
++    ThreadBase owner;
++    StackContext* nextInThread;
++
+     version (SupportSanitizers_ABI)
+     {
+         // Stores the thread-specific fake stack handler for this StackContext. This is used while GC scanning this StackContext's stack.
+--- a/druntime/src/core/thread/threadbase.d
++++ b/druntime/src/core/thread/threadbase.d
+@@ -604,6 +604,14 @@
+ 
+     __gshared StackContext*  sm_cbeg;
+ 
++    //
++    // Head of this thread's own context list, threaded through
++    // StackContext.nextInThread. A subset of sm_cbeg, maintained alongside it
++    // under the same lock, so that a collector interested only in its own
++    // stacks does not have to walk every other thread's.
++    //
++    StackContext*       m_cbeg;
++
+     __gshared ThreadBase    sm_tbeg;
+     __gshared size_t        sm_tlen;
+ 
+@@ -644,6 +652,15 @@
+             sm_cbeg.prev = c;
+         }
+         sm_cbeg = c;
++
++        // `add` runs on the thread that created the context, which is what
++        // makes the owner knowable here at all.
++        if (auto t = ThreadBase.getThis())
++        {
++            c.owner = t;
++            c.nextInThread = t.m_cbeg;
++            t.m_cbeg = c;
++        }
+     }
+ 
+     //
+@@ -665,6 +682,25 @@
+             c.next.prev = c.prev;
+         if (sm_cbeg == c)
+             sm_cbeg = c.next;
++
++        // ... and out of its owner's list. Singly linked, because removal is
++        // once per context lifetime while the walk it exists to shorten is
++        // once per collection; a thread with a pathological number of contexts
++        // pays here rather than there.
++        if (auto t = c.owner)
++        {
++            if (t.m_cbeg is c)
++                t.m_cbeg = c.nextInThread;
++            else
++                for (auto p = t.m_cbeg; p; p = p.nextInThread)
++                    if (p.nextInThread is c)
++                    {
++                        p.nextInThread = c.nextInThread;
++                        break;
++                    }
++            c.owner = null;
++            c.nextInThread = null;
++        }
+         // NOTE: Don't null out c.next or c.prev because opApply currently
+         //       follows c.next after removing a node.  This could be easily
+         //       addressed by simply returning the next node from this

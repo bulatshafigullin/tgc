@@ -201,12 +201,28 @@ repository.
 
 ### C. Needs someone else
 
-9. **Fiber enumeration is O(all fibers in the process)** (item 4b). Scanning is
-   already restricted to a thread's own fibers; enumeration cannot be, because
-   druntime's context list is the only authority on whether a stack is still
-   mapped. Fixing it needs a `ThreadBase` field recording the owning thread on
-   each `StackContext`, or a per-thread context list. Worth raising upstream
-   alongside the tgc PR.
+9. **Fiber enumeration is O(all fibers in the process)** (item 4b) —
+   prototyped, measured, and ready to send upstream. The patch is
+   `upstream/per-thread-stack-contexts.patch`, with its numbers and its
+   application instructions in `upstream/README.md`.
+
+   Two fields on `StackContext` (`owner`, `nextInThread`) and one on
+   `ThreadBase` (`m_cbeg`), threading each thread's contexts onto its own list
+   alongside the global one, maintained in the existing `add`/`remove` under the
+   existing lock. Built against a druntime patched from the LDC 1.42.0 source;
+   the whole tgc suite passes against it.
+
+   | threads | fibers in process | stock | patched |
+   |---|---|---|---|
+   | 1 | 2,000 | 0.40 ms | 0.41 ms |
+   | 2 | 4,000 | 0.43 ms | 0.43 ms |
+   | 4 | 8,000 | 0.47 ms | 0.45 ms |
+   | 8 | 16,000 | 0.54 ms | 0.47 ms |
+
+   Growth from one thread to eight falls from +33% to +10%. tgc uses the fields
+   when they exist and walks the global list when they do not, so it is correct
+   against either druntime and this is a pure improvement rather than a
+   dependency.
 10. **Escape tracking as the default** (item 2) — measured, and the answer is
     **no**, but the reason changed on the way. See item 2 below: the growth was
     not bounded at all, because the global-collection trigger counted only
@@ -543,9 +559,21 @@ first, took the 8-thread case from 0.38 ms to 0.29 ms. The residual growth is
 inherent: the global list is the only authority on whether a fiber's stack is
 still mapped.
 
-Removing it needs druntime's help — a `ThreadBase` field recording the owning
-thread on each `StackContext`, or a per-thread context list. Either would let a
-thread enumerate only its own. Worth raising upstream alongside the tgc PR.
+Removing it needs druntime's help, and that help is now written and measured:
+`upstream/per-thread-stack-contexts.patch` adds a per-thread context list
+alongside the global one, which lets a thread enumerate only its own. Prototyped
+against a druntime built from the LDC 1.42.0 source, with the whole tgc suite
+passing against it; at eight threads and 16,000 fibers it takes collection from
+0.54 ms to 0.47 ms, and growth from one thread to eight from +33% to +10%. tgc
+detects the fields and falls back to the global walk without them.
+
+Worth recording, because it is the kind of mistake that looks like a hang rather
+than a bug: the first version asserted that a context on the thread's own list
+was also a block this heap owns. It is not — a thread's `m_main` context is a
+field inside its `ThreadBase`, which another thread allocated — and the
+`AssertError` propagated out of the enumeration with druntime's thread lock
+held, so every thread trying to register itself blocked on it forever. The
+process sat at 0% CPU with six threads waiting on a mutex and no owner running.
 
 ### 5. `GC.collect()` collects only the calling thread
 

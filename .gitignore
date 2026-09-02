@@ -24,3 +24,4 @@ dub.selections.json
 /bench-trim
 /bench-gate
 /bench-escape
+/bench-fiber

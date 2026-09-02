@@ -112,3 +112,12 @@ configuration "bench-escape" {
     sourceFiles "bench/escape_probe.d"
     mainSourceFile "bench/escape_probe.d"
 }
+
+// What another thread's fibers cost a collection that has no interest in them.
+configuration "bench-fiber" {
+    targetType "executable"
+    targetName "bench-fiber"
+    sourcePaths "source"
+    sourceFiles "bench/fiber_probe.d"
+    mainSourceFile "bench/fiber_probe.d"
+}

@@ -651,6 +651,20 @@ commit.
 * CI builds `--build=release --d-version=TgcEnforce`, the one configuration
   where the ownership check cannot fall back on the assertion machinery.
 
+* *tgc uses a per-thread stack-context list when druntime has one*, and walks
+  the global list when it does not. Finding a thread's fibers means walking
+  `ThreadBase.sm_cbeg`, which holds every context in the process, and the
+  ownership test cannot leave `slock` -- release it and another thread may
+  destroy its fiber and unmap the stack about to be scanned. So a collection
+  walks T x F contexts to scan its own F.
++
+The druntime change that fixes it is written, built and measured:
+`upstream/per-thread-stack-contexts.patch`, two fields on `StackContext` and one
+on `ThreadBase`, maintained in the existing `add`/`remove` under the existing
+lock. With every thread holding 2,000 fibers and an identical live set, at eight
+threads it takes collection from 0.54 ms to 0.47 ms and growth from one thread
+to eight from +33% to +10%. The whole tgc suite passes against the patched
+runtime. `bench/fiber_probe.d` is the measurement.
 * *A regression gate runs in CI* (`bench/gate.sh`, `dub build -c bench-gate`).
   Nothing used to fail when a change made the collector slower, and this
   project's history is largely changes that did.
