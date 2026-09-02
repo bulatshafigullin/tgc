@@ -25,3 +25,6 @@ dub.selections.json
 /bench-gate
 /bench-escape
 /bench-fiber
+/bench/vibe/tgc-vibe-bench
+/bench/vibe/.dub/
+/bench/vibe/dub.selections.json

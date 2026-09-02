@@ -1,0 +1,14 @@
+name "tgc-vibe-bench"
+description "vibe.d HTTP server benchmarked under tgc and the default collector"
+targetType "executable"
+targetName "tgc-vibe-bench"
+
+// A separate package on purpose: vibe.d is a large dependency and nothing in
+// tgc itself should require it. The collector is picked up as a path
+// dependency, and chosen at *runtime* with --DRT-gcopt=gc:, so both columns of
+// a comparison run the same binary.
+dependency "vibe-d" version="~>0.10.3"
+dependency "tgc" path="../.."
+
+// TLS is left at whatever vibe-d resolves: the benchmark never opens an https
+// connection, so it costs a link-time dependency and nothing at run time.

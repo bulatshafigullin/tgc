@@ -705,6 +705,18 @@ breaking the collector on purpose and checking the gate said so.
   prefetching the chunk-directory entry for the pointer eight words ahead of the
   one being marked, which measured 2.8% slower over five. Three of the four
   ideas in the mark-phase list have now been tried and only interleaving paid.
+* `bench/vibe/` benchmarks a real vibe.d HTTP server under both collectors with
+  `wrk` -- fiber-per-request, thread-per-connection, which is the workload this
+  collector is aimed at rather than binary-trees. A standalone dub package, so
+  vibe.d never becomes a dependency of tgc.
++
+Findings in `bench/vibe/README.md`, including the negative one: tgc is 4-9%
+ahead on throughput and 7-8% on median latency at equal or better memory, but
+the *tail-latency* win a thread-private collector promises does not appear,
+because pauses on this workload are ~2 ms against a ~3 ms request and there is
+almost no tail for "stop one thread instead of four" to remove. Memory at the
+defaults is 45% worse and at a matched budget 19% better, which is a statement
+about default heap sizing rather than about the collectors.
 * `bench/webserver_probe.d` gained `noScanSweep`: collection time against a live
   set of buffers rather than of objects, which is the bulk of what a server
   actually holds and the opposite extreme from the existing sweep. It was added
