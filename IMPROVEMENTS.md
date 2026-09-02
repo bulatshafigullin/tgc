@@ -207,11 +207,14 @@ repository.
    mapped. Fixing it needs a `ThreadBase` field recording the owning thread on
    each `StackContext`, or a per-thread context list. Worth raising upstream
    alongside the tgc PR.
-10. **Escape tracking as the default** (item 2). Now that a global collection is
-    cheap, the question is whether tying local pause growth to the global
-    interval is acceptable on a realistic workload. Needs measurement before it
-    can be argued either way, and it is the difference between "unsupported" and
-    "handled" for the publish-to-a-global pattern.
+10. **Escape tracking as the default** (item 2) — measured, and the answer is
+    **no**, but the reason changed on the way. See item 2 below: the growth was
+    not bounded at all, because the global-collection trigger counted only
+    arenas from exited threads and never the promoted blocks. That is fixed, and
+    with it fixed the cost is bounded but still 2x on a program that publishes
+    nothing and 16-40x on one that publishes heavily. Opt-in is the right
+    default; what changed is that turning it on is now safe rather than a slow
+    leak.
 11. ~~**Benchmarks in CI**~~ ✅ Done — `bench/gate.sh`, see item 7 below for
     what it gates on and what it deliberately cannot.
 
@@ -431,17 +434,51 @@ state bitvectors so marking touches one line instead of two is worth 2.5% and is
 in. Moving `NO_SCAN` out of the attribute array measured *negative* and is not —
 see section B. Prefetching down the mark stack is still untried.
 
-### 2. Escape tracking still defaults to off
+### 2. Escape tracking stays off by default, and now it is bounded
 
-Phase 2 reclaims both adopted arenas and promoted blocks, so retention is no
-longer permanent. But `tgcTrackEscapes` remains opt-in, because between global
-collections the promoted set is still re-scanned on every local collection, so
-pauses still grow with published allocations — just boundedly now, reset by each
-global collection.
+Measured with `bench/escape_probe.d`, which models the pattern escape tracking
+exists for: publish to a global, hand off, unpublish — a fixed-size ring, so the
+*live* published set is constant and everything beyond it is retention.
 
-Making it the default would mean tying local pause time to the global-collection
-interval, which needs measurement on a realistic workload first. Worth
-revisiting.
+The premise of this entry was wrong. It said retention was "bounded now, reset by
+each global collection". It was not bounded, because no global collection ever
+ran: the automatic trigger compared `tgcGlobalThreshold` against `orphanBytes`
+alone — bytes in arenas adopted from **exited threads** — and blocks promoted by
+escape tracking counted for nothing. A program that turns tracking on and never
+exits a thread therefore never collects globally and never demotes anything.
+
+| 8M allocations, live set 0.6 MB | mean local pause | heap |
+|---|---|---|
+| tracking off | 0.15 ms, flat | 1.2–2.2 MB |
+| tracking on, before the fix | 0.26 → 8.10 ms, monotonic | 23 MB |
+| tracking on, after the fix | 1.4–5.9 ms, sawtooth | bounded by the threshold |
+
+The trigger now counts both, exposed as `tgcPromotedBytes()`. The promoted total
+is maintained from the re-seed loop that already visits every promoted slot, so
+it costs an add rather than a pass.
+
+Two things fell out of measuring it:
+
+* **The re-seed loop was proportional to the heap, not to the promoted set.** It
+  was a per-slot loop over every chunk, so a program that had published nothing
+  still paid for every slot it owned on every collection. It now tests 64 slots
+  per word, like the sweep. That halved the floor: a collection with almost
+  nothing promoted went from 0.69 ms to 0.33 ms, against 0.14 ms with tracking
+  off.
+* **Tracking promotes everything reachable from any global root**, not only what
+  you deliberately publish. A `__gshared` cache is promoted in its entirety.
+  That is correct and it is also the reason the cost is what it is.
+
+So: **still opt-in.** Even fixed and optimized it costs about 2x the local pause
+on a program that publishes nothing and 16–40x on one that publishes heavily,
+and a program that shares nothing should not pay for a mechanism it does not
+need. What changed is that turning it on is now a bounded cost rather than a
+slow leak, which is the difference between "unsupported" and "handled" that item
+C10 was really asking about.
+
+The remaining hole is unchanged and unfixable without a write barrier: promotion
+is *sampled* at collection time, so a block published, shared and unpublished
+entirely between two collections is never seen. See `CROSS-THREAD.md`.
 
 ### 3. Every thread scans every other thread's fibers
 

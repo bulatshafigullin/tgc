@@ -103,3 +103,12 @@ configuration "bench-gate" {
     sourceFiles "bench/gate.d"
     mainSourceFile "bench/gate.d"
 }
+
+// What escape tracking costs, and whether it could be the default.
+configuration "bench-escape" {
+    targetType "executable"
+    targetName "bench-escape"
+    sourcePaths "source"
+    sourceFiles "bench/escape_probe.d"
+    mainSourceFile "bench/escape_probe.d"
+}

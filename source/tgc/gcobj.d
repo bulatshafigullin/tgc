@@ -53,8 +53,15 @@ bool tgcCollectGlobal()
 /**
  * Retained bytes at which a global collection triggers automatically.
  *
- * Defaults to 64 MiB. Set to 0 to disable automatic global collection, in which
- * case retained memory grows until `tgcCollectGlobal` is called explicitly.
+ * Defaults to 64 MiB, and is compared against `tgcRetainedBytes` and
+ * `tgcPromotedBytes` *together*: arenas adopted from exited threads and blocks
+ * promoted by escape tracking are both reclaimable only globally. It used to
+ * count the arenas alone, which meant a program that turned escape tracking on
+ * and never exited a thread never collected globally at all, and its promoted
+ * set -- re-scanned by every local collection -- grew without bound.
+ *
+ * Set to 0 to disable automatic global collection, in which case retained
+ * memory grows until `tgcCollectGlobal` is called explicitly.
  */
 void tgcGlobalThreshold(size_t bytes) nothrow @nogc
 {
@@ -77,6 +84,24 @@ size_t tgcGlobalThreshold() nothrow @nogc
 size_t tgcRetainedBytes() nothrow @nogc
 {
     return tgc_getRetainedBytes();
+}
+
+/**
+ * Bytes in blocks promoted by `tgcTrackEscapes`, across every live heap.
+ *
+ * The other half of what only a global collection can reclaim. A thread-local
+ * collection cannot demote a promoted block -- only a global one can prove no
+ * other thread still holds it -- so this grows with everything the program
+ * publishes, and falls back to the live published set when a global collection
+ * runs. Automatic global collection triggers on this and `tgcRetainedBytes`
+ * together, so a program that publishes but never exits a thread is covered.
+ *
+ * Meaningful only while escape tracking is on; with it off nothing is promoted
+ * and the figure holds at whatever the last collection saw.
+ */
+size_t tgcPromotedBytes() nothrow @nogc
+{
+    return tgc_getPromotedBytes();
 }
 
 /**

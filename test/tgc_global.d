@@ -251,3 +251,77 @@ unittest
         "the automatic global-collection trigger never fired; retained memory " ~
         "grew unbounded");
 }
+
+// ---------------------------------------------------------------------------
+// promoted blocks drive the automatic global collection too
+// ---------------------------------------------------------------------------
+
+__gshared void[][512] publishedRing;
+
+/**
+ * The trigger used to read only the bytes held in arenas adopted from exited
+ * threads. Blocks promoted by escape tracking are the other half of what a
+ * thread-local collection cannot reclaim, and they counted for nothing -- so a
+ * program that turned tracking on and never exited a thread never collected
+ * globally, and its promoted set, re-scanned by every local collection, grew
+ * without bound. Measured before the fix on `bench/escape_probe.d`: local pause
+ * climbing from 0.26 ms to 8.10 ms over eight million allocations against a
+ * live set of 0.6 MB, monotonically, with no global collection ever running.
+ *
+ * Asserts that the promoted total *fell* at some point rather than that it
+ * stayed under some size. A magnitude bound passes for the wrong reason as soon
+ * as the test is not run for long enough; only a fall proves the trigger fired,
+ * because nothing else can demote a promoted block.
+ */
+unittest
+{
+    import core.memory : GC;
+
+    immutable savedThreshold = tgcGlobalThreshold();
+    immutable savedTracking = tgcTrackEscapes();
+    scope (exit)
+    {
+        tgcTrackEscapes(savedTracking);
+        tgcGlobalThreshold(savedThreshold);
+        tgcCollectGlobal();
+    }
+
+    tgcCollectGlobal();          // start from a demoted state
+    tgcTrackEscapes(true);
+    tgcGlobalThreshold(2 * 1024 * 1024);
+
+    // Publish into a fixed-size ring, so the *live* published set stays tiny
+    // while the promoted set grows: each store drops the previous occupant,
+    // which only a global collection can prove is gone.
+    size_t n = 0;
+    size_t peak = 0;
+    bool fell = false;
+    foreach (batch; 0 .. 60 / (workScale > 2 ? workScale : 1) + 1)
+    {
+        foreach (k; 0 .. 4000)
+        {
+            auto o = new ubyte[256];
+            o[0] = cast(ubyte) k;
+            keepAlive(o.ptr);
+            if (k % 4 == 0)
+                publishedRing[n++ % publishedRing.length] = new ubyte[512];
+        }
+
+        immutable now = tgcPromotedBytes();
+        if (now + 256 * 1024 < peak)
+            fell = true;
+        if (now > peak)
+            peak = now;
+    }
+
+    assert(fell,
+        "blocks promoted by escape tracking never triggered a global " ~
+        "collection: the promoted set only ever grew");
+
+    // And the mechanism still reclaims on demand.
+    immutable before = tgcPromotedBytes();
+    tgcCollectGlobal();
+    GC.collect();
+    assert(tgcPromotedBytes() <= before,
+        "a global collection did not demote anything");
+}

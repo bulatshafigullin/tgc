@@ -1694,6 +1694,46 @@ private struct Chunk
         }
     }
 
+    /**
+     * Index of the next slot that is both allocated and promoted, at or after
+     * `from`; `slotCount` when there is none.
+     *
+     * Escape tracking re-seeds every promoted block as a root on every local
+     * collection, and used to find them with a per-slot loop over the whole
+     * chunk. That made the cost of having escape tracking *on* proportional to
+     * the heap rather than to the promoted set, which is backwards: a program
+     * that has published nothing paid for every slot it owns. Testing 64 slots
+     * per word costs the same as the equivalent test in the sweep.
+     */
+    size_t nextShared(size_t from) const nothrow @nogc
+    {
+        immutable size_t groups = bitWords(slotCount);
+        size_t g = from / bitsPerWord;
+        if (g >= groups)
+            return slotCount;
+
+        const(size_t)* grp = bits + g * wordsPerGroup;
+        size_t w = grp[gAlloc] & grp[gShared];
+        immutable size_t off = from % bitsPerWord;
+        if (off)
+            w &= ~cast(size_t) 0 << off;
+
+        for (;;)
+        {
+            if (w)
+            {
+                import core.bitop : bsf;
+
+                size_t idx = g * bitsPerWord + bsf(w);
+                return idx < slotCount ? idx : slotCount;
+            }
+            if (++g >= groups)
+                return slotCount;
+            grp = bits + g * wordsPerGroup;
+            w = grp[gAlloc] & grp[gShared];
+        }
+    }
+
     /// Like `nextReclaimable`, but ignores promotion: a global collection has
     /// already proven reachability, so the sticky bit must not veto it.
     size_t nextReclaimableIgnoringShared(size_t from) const nothrow @nogc
@@ -2124,6 +2164,10 @@ private struct ThreadHeap
     const(size_t)* memoBitmap;
     size_t memoElemWords;
 
+    /// This heap's share of `promotedBytes`, so the global total is kept with a
+    /// delta rather than recomputed across every heap.
+    size_t promotedHere;
+
     size_t usedBytes;      /// bytes in allocated slots
     size_t reservedBytes;  /// bytes held in chunks, allocated or not
     size_t allocatedTotal; /// bytes allocated on this thread since start
@@ -2161,6 +2205,16 @@ private struct ThreadHeap
             onOutOfMemoryError();
         h.collectThreshold = atomicLoad(minHeapSize);
         return h;
+    }
+
+    /// Fold this heap's promoted total into the global one, as a delta.
+    void publishPromoted(size_t now) nothrow @nogc
+    {
+        if (now > promotedHere)
+            atomicOp!"+="(promotedBytes, now - promotedHere);
+        else if (now < promotedHere)
+            atomicOp!"-="(promotedBytes, promotedHere - now);
+        promotedHere = now;
     }
 
     void destroy() nothrow @nogc
@@ -2714,6 +2768,31 @@ private __gshared SpinLock orphanLock;
 
 /// Bytes held in arenas adopted from exited threads. Drives the global-collection trigger.
 private shared size_t orphanBytes;
+
+/**
+ * Bytes in blocks promoted by escape tracking, across every live heap.
+ *
+ * The other half of what only a global collection can reclaim, and it used to
+ * be missing from the trigger entirely -- which read `orphanBytes` alone, so a
+ * program that turned escape tracking on and never exited a thread never ran a
+ * global collection and never demoted anything. Measured with
+ * `bench/escape_probe.d`: over eight million allocations against a live set of
+ * 0.6 MB the heap grew to 16.9 MB and local pause from 0.61 ms to 6.76 ms,
+ * monotonically, while `tgcRetainedBytes` reported zero throughout. One
+ * explicit `tgcCollectGlobal()` took it straight back to 0.6 MB.
+ *
+ * Maintained from the re-seed loop in `collectHeap`, which already visits every
+ * promoted slot, so it costs an add. Accurate only while escape tracking is on:
+ * with it off nothing is being promoted and that loop does not run, so the
+ * total holds at whatever the last collection saw.
+ */
+private shared size_t promotedBytes;
+
+/// ditto
+extern (C) size_t tgc_getPromotedBytes() nothrow @nogc
+{
+    return atomicLoad(promotedBytes);
+}
 
 private void adoptOrphanChunks(ThreadHeap* dying) nothrow @nogc
 {
@@ -3799,6 +3878,11 @@ class ThreadGC : GC
         // being torn down.
         unregisterHeap(h);
 
+        // Whatever this heap holds promoted is about to be counted as an
+        // adopted arena instead, so drop its contribution first rather than
+        // counting the same bytes twice.
+        h.publishPromoted(0);
+
         // Do NOT finalize or release the thread's blocks here. Thread.join()
         // hands the child's Throwable to the parent after this point, so doing
         // either is a use-after-free in ordinary code. Move the arenas to the
@@ -3919,7 +4003,8 @@ private:
             // after a local collection rather than on every allocation, so the
             // cost is amortised and the world stops rarely.
             auto threshold = atomicLoad(globalThreshold);
-            if (threshold != 0 && atomicLoad(orphanBytes) >= threshold
+            immutable size_t retained = atomicLoad(orphanBytes) + atomicLoad(promotedBytes);
+            if (threshold != 0 && retained >= threshold
                 && !heap.collecting && !heap.finalizing)
                 collectGlobal(this);
         }
@@ -4004,22 +4089,29 @@ private:
         // from anything this thread can see while another thread still holds
         // it, so it must be scanned, or its children -- which may never have
         // been global themselves -- would be swept out from under that thread.
+        size_t promotedNow = 0;
         for (auto c = heap.allChunks; c; c = c.nextAll)
         {
-            // One memset over n/8 bytes, rather than a read-modify-write on
-            // every slot's metadata.
+            // One strided pass over the state groups, rather than a
+            // read-modify-write on every slot's metadata.
             c.clearMarks();
             if (!trackEscapes)
                 continue;
-            foreach (idx; 0 .. c.slotCount)
+            for (size_t idx = c.nextShared(0); idx < c.slotCount;
+                 idx = c.nextShared(idx + 1))
             {
-                if (!c.isAllocated(idx) || !c.isShared(idx))
-                    continue;
                 c.setMarked(idx);
+                promotedNow += c.capacity();
                 if (!(c.attrOf(idx) & BlkAttr.NO_SCAN))
                     heap.pushMark(c.slotAt(idx), c.capacity());
             }
         }
+
+        // Publish what this heap holds promoted, so the global-collection
+        // trigger can see it. Free, in the sense that the loop above has just
+        // visited every one of these slots anyway.
+        if (trackEscapes)
+            heap.publishPromoted(promotedNow);
 
         if (trackEscapes)
         {

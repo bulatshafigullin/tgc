@@ -384,6 +384,27 @@ where the lines were being wasted. `clearMarks` gives up its `memset` for a
 strided loop in exchange, which runs once per 64 slots against the mark path's
 once per object.
 
+* *Blocks promoted by escape tracking now drive the automatic global
+  collection.* The trigger compared `tgcGlobalThreshold` against `orphanBytes`
+  alone -- bytes in arenas adopted from threads that had **exited** -- so a
+  program that turned `tgcTrackEscapes` on and never exited a thread never ran a
+  global collection, never demoted anything, and re-scanned an ever-growing
+  promoted set on every local collection.
++
+Measured with the new `bench/escape_probe.d`, over eight million allocations
+against a live set of 0.6 MB: mean local pause climbing from 0.26 ms to 8.10 ms,
+monotonically, with the heap at 23 MB, while `tgcRetainedBytes` reported zero
+throughout. With the trigger counting both, the same run sawtooths between
+1.4 ms and 5.9 ms and the heap is bounded by the threshold. `tgcPromotedBytes()`
+exposes the figure; the total is maintained from the re-seed loop that already
+visits every promoted slot, so it costs an add.
+* *The escape-tracking re-seed loop is proportional to the promoted set rather
+  than to the heap.* It walked every slot of every chunk, so a program that had
+  published nothing still paid for every slot it owned on every collection. It
+  now tests 64 slots per word, as the sweep does: a collection with almost
+  nothing promoted went from 0.69 ms to 0.33 ms, against 0.14 ms with tracking
+  off entirely.
+
 === Added
 
 * `tgcMinHeap(size_t)` — a floor on a thread's collection threshold, the
