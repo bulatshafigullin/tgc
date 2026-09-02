@@ -78,6 +78,25 @@ jobs:
       - name: Build with TgcEnforce
         run: dub build --build=release --d-version=TgcEnforce
 
+  # Nothing used to fail when a change made the collector slower, and this
+  # project's history is mostly changes that did. Three of the four mark-phase
+  # optimizations tried most recently were regressions, all plausible enough to
+  # ship. A shared runner cannot resolve the few per cent those turned on -- so
+  # this gates on what a shared runner *can* measure: tgc against the default
+  # collector on the same machine in the same minute, tgc against itself at a
+  # quarter of the live set, and facts that are simply true or false. See the
+  # header of bench/gate.sh for the calibration behind each threshold.
+  gate:
+    name: regression gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dlang-community/setup-dlang@v1
+        with:
+          compiler: ldc-latest
+      - name: bench/gate.sh
+        run: bench/gate.sh
+
   sanitizers:
     name: ldc / ${{ matrix.sanitizer }}
     runs-on: ubuntu-latest

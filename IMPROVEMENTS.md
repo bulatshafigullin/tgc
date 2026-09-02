@@ -190,9 +190,11 @@ way the counters suggested — tgc already misses cache less than druntime's
 collector on the same live set, and these three were all attempts to miss even
 less.
 
-What that leaves is the observation that the next honest step is not another
-micro-optimization but a regression gate: three of these four rejections were
-*plausible*, and nothing in CI would have caught them. That is item 11.
+That observation is what motivated the regression gate, since three of these
+four rejections were *plausible* and nothing in CI would have caught them had
+they gone the other way. It is now item 11, and done — though it is worth being
+honest that it would not have caught these either: they are all a few per cent,
+and a shared runner cannot see a few per cent.
 
 Nothing here blocks tagging 0.2.0. Section C needs help from outside the
 repository.
@@ -210,9 +212,8 @@ repository.
     interval is acceptable on a realistic workload. Needs measurement before it
     can be argued either way, and it is the difference between "unsupported" and
     "handled" for the publish-to-a-global pattern.
-11. **Benchmarks in CI** (item 7). Nothing fails today when a change makes the
-    mark phase slower. Pause per collection on a fixed live set is the most
-    stable thing to gate on; a shared runner's wall clock is not.
+11. ~~**Benchmarks in CI**~~ ✅ Done — `bench/gate.sh`, see item 7 below for
+    what it gates on and what it deliberately cannot.
 
 ### Not planned, and why
 
@@ -528,15 +529,38 @@ needs and not what shape it will be in.
 `extend()` still reports usable slack but cannot grow a slot, which is
 unchanged and separate.
 
-### 7. Benchmarks are in the repo, but not in CI
+### 7. Benchmarks in CI — done
 
-`dub build -c bench-bintree|bench-mt|bench-region` and `bench/run.sh` build the
-three binary-trees variants and run each under both collectors, reporting wall
-time, collections and pause distribution; `BENCHMARKS.md` records the numbers.
-What is still missing is CI: nothing fails when a change makes the mark phase
-slower, and a shared runner's timings are noisy enough that the threshold needs
-thought. Pause *per collection* on a fixed live set is the most stable metric to
-gate on.
+`bench/gate.sh` runs on every change and fails the build. The problem it had to
+solve is that a shared runner cannot measure speed, so nothing it looks at is a
+speed: every figure is either dimensionless or exact.
+
+* **tgc against the default collector**, on the same live set, on the same
+  machine, in the same minute. The runner's speed cancels. Measured 1.40 on
+  arm64 and 1.42 on x86-64 — close enough across architectures to gate on, which
+  was not obvious in advance.
+* **tgc against itself** at a quarter of the live set. Four times the live set
+  should cost four times as much; it measures 4.05 and 4.07. This is the check
+  that would have caught the original quadratic collector, and it needs no
+  baseline and no second collector.
+* **Facts that are true or false**: the trim returns memory, the trim is still
+  enabled by default, `GC.reserve` reserves, a dropped live set is reclaimed.
+  Every one of these has been broken by a change at some point, and every one
+  fails silently.
+
+Every measurement is the best of three runs rather than the mean, because
+interference on a shared runner only ever adds time. That matters more than it
+sounds: the raw single-run ratio on a loaded machine spans 1.31 to 1.76, and
+best-of-three brings five consecutive runs into 1.39 to 1.59 against a 2.5
+ceiling.
+
+**What it does not catch**, stated plainly because the temptation is to assume
+otherwise: a few per cent. It would not have caught the 7% trim-thrash
+regression found earlier in this same pass, and nothing that runs on a shared
+runner would. Changes at that scale still have to be measured by hand, paired
+and interleaved. What this catches is the class of regression that has actually
+happened here — quadratic collection time, a sweep costing 21x, an allocator
+faulting pages in a loop, and a feature quietly ceasing to work.
 
 ### 8. Precise scanning is on, but is the newest and least-proven feature
 

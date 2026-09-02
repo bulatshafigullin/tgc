@@ -630,6 +630,26 @@ commit.
 * CI builds `--build=release --d-version=TgcEnforce`, the one configuration
   where the ownership check cannot fall back on the assertion machinery.
 
+* *A regression gate runs in CI* (`bench/gate.sh`, `dub build -c bench-gate`).
+  Nothing used to fail when a change made the collector slower, and this
+  project's history is largely changes that did.
++
+A shared runner cannot measure speed, so nothing the gate looks at is a speed.
+Two figures are dimensionless -- tgc against the default collector on the same
+live set on the same machine, and tgc against itself at a quarter of the live
+set -- and the rest are facts that are true or false: the trim returns memory,
+the trim is still on by default, `GC.reserve` reserves, a dropped live set is
+reclaimed. Each measurement is the best of three runs rather than the mean,
+since interference only ever adds time; that takes the ratio on a loaded machine
+from a 1.31-1.76 spread down to 1.39-1.59 across five consecutive runs, against
+a 2.5 ceiling.
++
+It will not catch a few per cent, and neither would anything else that runs on a
+shared runner -- the 7% regression found earlier in this pass would have sailed
+through it. What it catches is what has actually gone wrong here before:
+quadratic collection time, a sweep costing 21x, an allocator faulting pages in a
+loop, and a feature silently ceasing to work. Each failure path was verified by
+breaking the collector on purpose and checking the gate said so.
 * Everything here verified on Linux/x86-64 as well as macOS/arm64: the full
   suite under LDC 1.42.0 and DMD 2.113.0, in both the ordinary and the optimized
   build; ThreadSanitizer clean; AddressSanitizer clean; and the release

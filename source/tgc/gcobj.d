@@ -280,6 +280,12 @@ size_t tgcCommittedBytes() nothrow @nogc
  * breathing heap keeps its headroom and only a program whose demand has
  * actually fallen hands anything back.
  *
+ * Memory comes back about a second after demand falls, not immediately: one
+ * collection past the window re-baselines the peak now that the program has
+ * stopped asking for memory, and the next one acts on it. That is the cost of
+ * the hysteresis, and it is why a burst followed by silence returns its memory
+ * on the second collection rather than the first.
+ *
  * Raise the factor to favour throughput, lower it to favour resident size;
  * whatever the setting, at least one segment is always kept.
  */

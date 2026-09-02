@@ -8,6 +8,9 @@ bench/run.sh -d 16 -r 1     # quicker
 bench/run.sh -b bintree     # one variant
 ```
 
+`bench/gate.sh` is a different thing again: the regression gate CI runs, which
+measures nothing absolute and so is worth running anywhere. See its header.
+
 Two probes sit outside the driver, because what they measure is not wall time:
 `bench/webserver_probe.d` (`--config=bench-webserver`) for collection time
 against live set and against suspended fibers, and `bench/trim_probe.d`

@@ -94,3 +94,12 @@ configuration "bench-trim" {
     sourceFiles "bench/trim_probe.d"
     mainSourceFile "bench/trim_probe.d"
 }
+
+// The CI regression gate; driven by bench/gate.sh.
+configuration "bench-gate" {
+    targetType "executable"
+    targetName "bench-gate"
+    sourcePaths "source"
+    sourceFiles "bench/gate.d"
+    mainSourceFile "bench/gate.d"
+}
