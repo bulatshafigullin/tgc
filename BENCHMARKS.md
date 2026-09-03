@@ -14,9 +14,13 @@ measures nothing absolute and so is worth running anywhere. See its header.
 `bench/vibe/` is a standalone dub package -- vibe.d is a large dependency and
 nothing in tgc should require it -- benchmarking a real HTTP server under both
 collectors with `wrk`. It is the closest thing here to the workload tgc is aimed
-at, and `bench/vibe/README.md` records what it found: a 4-9% throughput and 7-8%
-median win at equal or better memory, and *not* the tail-latency win the
-architecture promises, for reasons worth reading.
+at, and it runs three columns: the default collector, tgc, and tgc with a
+per-request region. `bench/vibe/README.md` records what it found -- regions cut
+collections and total pause by 4-5x and win the p99 once the live set is large
+enough for tracing to cost anything, at a 12-16% throughput price that is a
+fixed per-region cost and is fixable; plain tgc is a 4-8% throughput and 7-8%
+median win at equal memory. Also what does not work: wrapping a vibe.d handler
+in a region crashes it, and `tgcRegionVerify` does not catch that.
 
 Two probes sit outside the driver, because what they measure is not wall time:
 `bench/webserver_probe.d` (`--config=bench-webserver`) for collection time

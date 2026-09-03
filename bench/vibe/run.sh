@@ -40,8 +40,9 @@ PORT=18080
 BUILD=1
 REPS=3
 MATCH=""
+REGION=0
 
-while getopts "r:d:t:c:W:k:w:p:N:m:nh" opt; do
+while getopts "r:d:t:c:W:k:w:p:N:m:Rnh" opt; do
     case "$opt" in
         r) ROUTE=$OPTARG ;;
         d) DURATION=$OPTARG ;;
@@ -53,6 +54,7 @@ while getopts "r:d:t:c:W:k:w:p:N:m:nh" opt; do
         p) PORT=$OPTARG ;;
         N) REPS=$OPTARG ;;
         m) MATCH=$OPTARG ;;
+        R) REGION=1 ;;
         n) BUILD=0 ;;
         h) sed -n '2,30p' "$0"; exit 0 ;;
         *) exit 2 ;;
@@ -81,11 +83,18 @@ run_one() {
     # generated values with no spaces in them, so word splitting is what is
     # wanted here.
     local tuning=""
-    if [[ -n "$MATCH" && "$gc" == tgc ]]; then
+    if [[ -n "$MATCH" && "$gc" != conservative ]]; then
         tuning="--min-heap=$MATCH --growth=2"
     fi
+    # The third column, `tgc-region`, is the same collector with each request's
+    # scratch in a per-request region.
+    local realgc=$gc
+    if [[ "$gc" == tgc-region ]]; then
+        realgc=tgc
+        tuning="$tuning --region"
+    fi
 
-    ./tgc-vibe-bench "--DRT-gcopt=gc:$gc" "--port=$PORT" "--threads=$THREADS" \
+    ./tgc-vibe-bench "--DRT-gcopt=gc:$realgc" "--port=$PORT" "--threads=$THREADS" \
         "--cache=$CACHE" "--work=$WORK" $tuning >"$TMP/server.log" 2>&1 &
     local pid=$!
 
@@ -147,6 +156,7 @@ for ((rep = 0; rep < REPS; rep++)); do
     echo "  rep $((rep + 1))/$REPS ..." >&2
     run_one conservative "$TMP/cons.$rep.txt"
     run_one tgc "$TMP/tgc.$rep.txt"
+    [[ $REGION -eq 1 ]] && run_one tgc-region "$TMP/region.$rep.txt"
 done
 
 python3 - "$TMP" "$REPS" <<'PY'
@@ -193,8 +203,7 @@ def best(runs, key, higher):
     return max(vals) if higher else min(vals)
 
 cons_runs, tgc_runs = collect('cons'), collect('tgc')
-cons = {}
-tgc = {}
+region_runs = collect('region')
 
 # label, key, note, higher-is-better, unit
 rows = [
@@ -208,14 +217,19 @@ rows = [
     ('max pause ms',   'maxPauseMs',   'lower is better',            False, 'ms'),
 ]
 
+cols = [('conservative', cons_runs), ('tgc', tgc_runs)]
+if region_runs:
+    cols.append(('tgc+regions', region_runs))
+
 w = max(len(r[0]) for r in rows)
-print(f'{"":<{w}} | {"conservative":>14} | {"tgc":>14} | {"":<28}')
-print(f'{"-"*w}-|-{"-"*14}-|-{"-"*14}-|')
+print(f'{"":<{w}} | ' + ' | '.join(f'{n:>13}' for n, _ in cols) + ' |')
+print(f'{"-"*w}-|-' + '-|-'.join('-' * 13 for _ in cols) + '-|')
 for label, key, note, higher, unit in rows:
-    a, b = best(cons_runs, key, higher), best(tgc_runs, key, higher)
-    fa = '-' if a is None else f'{a:,.2f}{unit}'
-    fb = '-' if b is None else f'{b:,.2f}{unit}'
-    print(f'{label:<{w}} | {fa:>14} | {fb:>14} | {note}')
+    cells = []
+    for _, runs in cols:
+        v = best(runs, key, higher)
+        cells.append('-' if v is None else f'{v:,.2f}{unit}')
+    print(f'{label:<{w}} | ' + ' | '.join(f'{c:>13}' for c in cells) + f' | {note}')
 print()
 print(f'best of {reps} interleaved repetitions')
 print('Both pause figures are process-wide totals. They do not mean the same')
@@ -224,6 +238,8 @@ print('while each of tgc\'s stopped only the one thread that took it. Equal')
 print('totals therefore favour tgc by however many threads are running, which')
 print('is why the latency tail is the honest number to compare.')
 print()
-cm = best(tgc_runs, 'committedMB', True)
-print(f'tgc committed: {cm:.1f} MB' if cm is not None else 'tgc committed: -')
+for name, runs in cols[1:]:
+    cm = best(runs, 'committedMB', True)
+    if cm is not None:
+        print(f'{name} committed: {cm:.1f} MB')
 PY

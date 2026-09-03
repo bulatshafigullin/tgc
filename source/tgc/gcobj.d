@@ -157,7 +157,12 @@ bool tgcPreciseScanning() nothrow @nogc
  *
  * Enable `tgcRegionVerify` in tests: it checks the invariant dynamically at
  * every close, at the cost of a full mark, and is off by default for that
- * reason.
+ * reason. It has one blind spot worth knowing about: it deliberately does not
+ * scan the region's own fiber stack, since that stack legitimately holds
+ * references to region blocks while the region is running. A long-lived object
+ * reachable *only* from that stack -- the connection being served, for
+ * instance -- can therefore capture region memory without the verifier
+ * noticing. `bench/vibe/README.md` records a case where exactly that happened.
  *
  * Regions do not nest. Opening one on a fiber that already has one returns
  * null and changes nothing.

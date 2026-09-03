@@ -1,105 +1,145 @@
-# vibe.d benchmark: tgc against the default collector
+# vibe.d benchmark: tgc, tgc with per-request regions, and the default collector
 
 A real web framework rather than binary-trees, because that is what this
 collector is aimed at. vibe.d is fiber-per-request, so a collection has to
 enumerate and scan hundreds of suspended stacks, and a request is served
 entirely on the thread that accepted it, which is the shape thread-private heaps
-assume.
+assume — and a fiber is also what a region binds to, so the framework offers the
+region API its natural unit of work.
 
 ```
 dub build --build=release          # in this directory
 ./run.sh                           # /work, 4 threads, 30s, both collectors
-./run.sh -d 15 -t 4 -N 3           # shorter, three repetitions
+./run.sh -R                        # add a third column: tgc with regions
+./run.sh -d 15 -N 3 -k 100000      # shorter, 3 reps, a large live set
 ./run.sh -m 8                      # put tgc on a matched memory budget
-./run.sh -r /json                  # a route that barely allocates
 ```
 
-Both columns are the same binary; only `--DRT-gcopt=gc:` differs. Runs are
-interleaved rather than batched, and each figure is the best of N repetitions,
-because interference on a developer machine only ever lowers throughput and
-raises latency.
+All columns are the same binary; only `--DRT-gcopt=gc:` and `--region` differ.
+Runs are interleaved rather than batched, and each figure is the best of N
+repetitions, because interference on a developer machine only ever lowers
+throughput and raises latency.
+
+The two `/work` handlers do identical work through the same `renderPayload` and
+the same response call. The only difference is where the per-request scratch is
+allocated.
 
 ## Results
 
 macOS/arm64, LDC 1.42.0, `-release`. 4 server threads, 128 connections, 15 s,
-`/work` (a session object built, rendered, JSON-encoded, and kept in a
-4096-entry per-worker ring).
+best of 3.
 
-### At each collector's defaults
+### Small live set (4,096-entry cache, ~31 MB)
 
-| | conservative | tgc | |
+| | conservative | tgc | tgc+regions |
 |---|---|---|---|
-| requests/sec | 39,215 | **42,894** | +9% |
-| latency p50 | 3.15 ms | **2.89 ms** | -8% |
-| latency p99 | **5.12 ms** | 5.32 ms | +4% |
-| peak RSS | **53.4 MB** | 77.4 MB | +45% |
-| collections | 227 | 198 | |
-| max pause | **2.45 ms** | 3.55 ms | |
+| requests/sec | 41,000 | **43,410** | 38,312 |
+| latency p50 | 3.01 ms | **2.80 ms** | 3.28 ms |
+| latency p99 | **4.00 ms** | 4.33 ms | 4.70 ms |
+| peak RSS | **31.3 MB** | **31.3 MB** | 32.6 MB |
+| collections | 674 | 739 | **147** |
+| total pause | 458 ms | 977 ms | **198 ms** |
 
-Best of 3.
+### Large live set (100,000-entry cache, ~115-145 MB)
 
-### At a matched memory budget (`-m 8`: 8 MB/thread floor, growth 2)
-
-| | conservative | tgc | |
+| | conservative | tgc | tgc+regions |
 |---|---|---|---|
-| requests/sec | 40,701 | **42,411** | +4% |
-| latency p50 | 3.08 ms | **2.85 ms** | -7% |
-| latency p99 | **4.87 ms** | 5.09 ms | +5% |
-| peak RSS | 53.4 MB | **43.1 MB** | -19% |
-| collections | 237 | 580 | |
-| max pause | **1.82 ms** | 2.43 ms | |
-
-Best of 5.
+| requests/sec | 40,907 | **44,134** | 37,158 |
+| latency p50 | 3.02 ms | **2.79 ms** | 3.31 ms |
+| latency p99 | 7.71 ms | 8.16 ms | **6.59 ms** |
+| peak RSS | **115.0 MB** | 145.6 MB | 143.1 MB |
+| collections | 108 | 109 | **25** |
+| total pause | 377 ms | 524 ms | **118 ms** |
 
 ## What this says
 
-**tgc is modestly faster and its memory is a tuning decision.** Throughput is
-4-9% better and the median 7-8% better in every configuration measured. Memory
-is 45% *worse* at the defaults and 19% *better* when told to use a comparable
-budget — which is a statement about default heap sizing policy, not about the
-collectors. tgc grows a thread's heap by 4x with a 32 MB floor, *per thread*,
-where the default collector sizes one pool for the whole process; multiply the
-first by four threads and the difference is entirely accounted for.
+**Regions do exactly what they claim about garbage collection, and it is not
+close.** Collections drop 4.4x and total pause 4.4x with a large live set, 5x
+with a small one. Request garbage allocated in a region is released at the end
+of the request without ever being traced, so the collector simply never sees
+it — that is the whole mechanism and it works.
 
-**The tail-latency win a thread-private collector promises does not appear
-here, and it is worth being precise about why.** The mechanism is real: every
-pause the default collector takes stops all four threads, while each of tgc's
-stops one. But the pauses on this workload are ~2 ms against a ~3 ms request, so
-there is very little tail for that mechanism to remove — p99 is 5 ms either way,
-and the difference between stopping one thread and four is lost in it. The
-advantage needs pauses that are *large* relative to request latency, which means
-a large live set.
+**Whether that is worth having depends on the live set.** With a small one it is
+not: p99 is 4.70 ms against 4.00 ms and throughput is 12% down, because there was
+never much tracing to remove. With a large one the tail flips — p99 6.59 ms
+against 7.71 ms for the default collector and 8.16 ms for plain tgc, the only
+configuration measured here where anything beats the default collector's tail.
+That is the shape to expect: regions remove the cost of tracing request garbage,
+which is worth removing exactly when tracing is expensive.
 
-**At a large live set the comparison stops being about the collector.** With a
-200,000-entry ring (`-k 200000`, a ~1.2 GB heap) pauses reach 80-190 ms and p99
-reaches 50-80 ms, and tgc comes out worse. Two things are mixed together there
-and neither is the stop-the-world question:
+**Regions cost throughput, and the reason is a fixed cost per region rather than
+contention.** It is 12-16% in every configuration, and it does not grow with
+thread count (14% at one thread, 12% at four), which rules out the global
+segment lock that `IMPROVEMENTS.md` flags as the suspect for allocation-heavy
+multi-threaded workloads. Measured directly:
 
-* Memory. Single-threaded, where connection distribution cannot be a factor,
-  tgc holds 1,435 MB against 658 MB and its max pause is 159 ms against 138 ms
-  -- 15% worse pause for 2.2x the memory, at the default growth factor.
-* Distribution. At four threads the same test gives tgc a 194 ms max pause
-  against 80 ms, much worse than the single-threaded gap, which points at
-  `SO_REUSEPORT` handing one thread a disproportionate share of the connections.
-  A thread-private collector pays for that directly: the worst thread's live set
-  is what sets the worst pause, where a global collector averages it away.
+| | ns |
+|---|---|
+| open and close an empty region | 32 |
+| 24 allocations inside a region | 1,637 |
+| the same 24 allocations, no region | 566 |
 
-So the honest summary is that on a realistic vibe.d workload tgc is a small
-throughput and median win at equal or better memory, not a tail-latency win --
-and that the configuration where its architecture should pay is one where other
-effects arrive first.
+Opening a region is free. *Allocating* in one is roughly three times the price,
+because a region owns its chunks exclusively, so it builds fresh ones and hands
+them back at close — a chunk creation, its metadata wipe and its release, per
+region per size class. At a ~25 µs request that is around a microsecond of pure
+overhead, which is the 12-16%.
+
+That points at a concrete improvement rather than a limitation: a per-thread
+cache of region chunks, so a closing region hands its chunks to the next region
+on that thread instead of to the segment allocator. `bintree_region.d` already
+shows regions winning outright when the work inside one is large; this benchmark
+is the case where the fixed cost dominates, and it is fixable.
+
+**Plain tgc is a small win at equal memory.** 4-8% ahead on throughput and 7-8%
+on median in every configuration, roughly level on p99, and its memory depends
+on how it is told to size heaps — it grows a thread's heap 4x with a 32 MB
+floor, *per thread*, where the default collector sizes one pool for the process.
+
+## Regions and vibe.d: what does not work
+
+Wrapping the whole handler in a region — the obvious thing, and what the region
+documentation's example looks like — **crashes vibe.d**, reproducibly, on about
+the 34th request:
+
+```
+EXC_BAD_ACCESS  InterfaceProxy!OutputStream.__postblit
+                HTTP1ServerExchange.bodyWriter
+                HTTPServerResponse.doWriteJsonBody
+                app.handleWorkRegion
+```
+
+vibe.d runs request handling through a `RegionListAllocator!GCAllocator` owned
+by the *connection* and reused across requests on it. Allocate that inside a
+region and it is region memory: freed when that request's region closes, and
+used again by the next request on the same keep-alive connection. The region
+documentation names this exactly — "a keep-alive connection object" — and it is
+easy to walk into anyway, because the offending allocation is vibe.d's, not
+yours.
+
+So the handler here keeps the region around the *scratch work only*, writes the
+response after closing it, and copies the one value that has to survive out
+through `malloc` — the deep-copy-on-the-way-out discipline regions require. With
+that structure it runs clean under `--region-verify`.
+
+**`tgcRegionVerify` did not catch the broken version**, and that is worth
+knowing. The verifier reports references into a region from outside, but it
+deliberately excludes the region's own fiber stack, since that stack legitimately
+holds region references while the region runs. The connection object is reachable
+from precisely that stack — so the one reference that mattered was in the one
+place the verifier does not look. It is a real blind spot, not a bug in the
+handler.
 
 ## Notes on the setup
 
 * The per-worker cache is thread-local, not `__gshared`. That is realistic for a
-  per-worker cache and it is also the only shape tgc supports without
-  `tgcTrackEscapes`: a block published to a global and read from another thread
-  is the one pattern thread-private heaps cannot handle. Measuring the shared
-  variant would be measuring escape tracking, which `bench/escape_probe.d` does.
+  per-worker cache and is also the only shape tgc supports without
+  `tgcTrackEscapes`. Measuring the shared variant would be measuring escape
+  tracking, which `bench/escape_probe.d` does.
 * Each thread builds its own router and `HTTPServerSettings`. Sharing one would
   put a GC block allocated on the main thread into every worker's hands.
-* `latency max` is printed by `run.sh` but is not used for any conclusion here:
-  it is a single worst sample and it flipped between 7.7 ms and 26.9 ms for the
-  same configuration across repetitions. p99 is the tail figure worth reading.
-* Both `total pause` figures are process-wide, and they do not mean the same
-  thing -- see the note `run.sh` prints.
+* `latency max` is printed but no conclusion here rests on it: it is a single
+  worst sample and flipped between 7.7 ms and 26.9 ms for one configuration
+  across repetitions. p99 is the tail figure worth reading.
+* Both `total pause` figures are process-wide and do not mean the same thing —
+  see the note `run.sh` prints.

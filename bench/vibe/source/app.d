@@ -43,6 +43,8 @@ import vibe.data.json;
 
 import core.memory : GC;
 import core.stdc.stdio : printf;
+import core.stdc.string : memcpy;
+import cstdlib = core.stdc.stdlib;
 import std.conv : to;
 import std.format : format;
 import core.time : hours;
@@ -77,6 +79,13 @@ private __gshared size_t workPerRequest = 24;
 private __gshared size_t growth;
 private __gshared size_t minHeapMb;
 
+/// Run each request's scratch work inside a per-request region.
+private __gshared bool useRegion;
+
+/// Check the region invariant at every close. A full mark per request, so this
+/// is for finding out whether the handler is sound, not for timing it.
+private __gshared bool verifyRegions;
+
 void handlePlaintext(HTTPServerRequest req, HTTPServerResponse res)
 {
     res.writeBody("Hello, World!", "text/plain");
@@ -95,7 +104,87 @@ void handleJson(HTTPServerRequest req, HTTPServerResponse res)
  * changing the shape of the live set, so allocation rate and live set can be
  * varied independently.
  */
+/**
+ * The same work as `handleWork`, with the per-request scratch in a region.
+ *
+ * This is the BEAM shape vibe.d makes available: a request is a fiber, a region
+ * binds to a fiber, and everything a request allocates and then throws away can
+ * be released at the end without ever being traced. The collector never marks
+ * any of it.
+ *
+ * The invariant is the caller's to keep, and it decides the structure here.
+ * Anything that outlives the request has to be allocated *outside* the region,
+ * so the cache entry -- the part that is deliberately long-lived -- is built
+ * before the region opens. Only the rendering, which nothing keeps, happens
+ * inside. Storing into `s` from within the region would put region memory in a
+ * live object and leave a dangling pointer the moment the region closed; the
+ * docs list "a cache entry populated mid-request" as exactly this mistake.
+ *
+ * Whether writing the *response* from inside the region is safe is not obvious
+ * and is not assumed: vibe.d keeps buffers on the connection across requests,
+ * and a buffer first allocated inside a region would dangle for every later
+ * request on that connection. `--region-verify` turns on `tgcRegionVerify`,
+ * which checks at every close that nothing outside points in, and is how that
+ * question was settled rather than argued.
+ */
+void handleWorkRegion(HTTPServerRequest req, HTTPServerResponse res)
+{
+    // Outside the region: this is the part that is kept.
+    auto s = newCacheEntry();
+    immutable n = cacheNext - 1;
+
+    // Inside: everything the request builds and drops. The response is written
+    // *after* the region closes, and the one value that has to survive it is
+    // copied out through malloc -- the deep-copy-on-the-way-out discipline
+    // regions require, and the reason this handler is shaped the way it is
+    // rather than simply wrapping the whole of `handleWork`.
+    char* carried;
+    size_t carriedLen;
+    scope (exit)
+        cstdlib.free(carried);
+
+    tgcRunInRegion({
+        immutable payload = renderPayload(n, s);
+        carriedLen = payload.length;
+        carried = cast(char*) cstdlib.malloc(carriedLen);
+        if (carried is null)
+            assert(false, "out of memory carrying the response out of the region");
+        memcpy(carried, payload.ptr, carriedLen);
+    });
+
+    // Outside the region again. Writing from inside is what vibe.d cannot
+    // survive: request handling runs through a `RegionListAllocator` owned by
+    // the *connection* and reused across requests on it, so the body writer
+    // built on the first request would be region memory, freed at that
+    // region's close and used again by the next request on the same
+    // connection. It crashes in `InterfaceProxy!OutputStream.__postblit` on
+    // roughly the 34th request, and `tgcRegionVerify` does not catch it --
+    // see this benchmark's README.
+    res.writeBody(cast(ubyte[]) carried[0 .. carriedLen], "application/json");
+}
+
 void handleWork(HTTPServerRequest req, HTTPServerResponse res)
+{
+    auto s = newCacheEntry();
+    immutable n = cacheNext - 1;
+
+    immutable payload = renderPayload(n, s);
+    res.writeBody(cast(ubyte[]) payload.dup, "application/json");
+}
+
+/**
+ * The part of a request that is deliberately kept: a cache entry.
+ *
+ * Allocated outside any region in both handlers, because it outlives the
+ * request. In the region handler that is not a style choice -- putting this in
+ * the region would leave the cache holding freed memory the moment the region
+ * closed, which is the mistake the region documentation calls out by name.
+ *
+ * Carrying a small persistent array as well as the two strings, so that the
+ * cache is a live set worth marking rather than a few hundred bytes: with
+ * `--cache 100000` it is tens of megabytes that every collection has to trace.
+ */
+Session newCacheEntry()
 {
     if (cacheRing.length != cacheSize)
     {
@@ -106,32 +195,44 @@ void handleWork(HTTPServerRequest req, HTTPServerResponse res)
     auto s = new Session;
     s.id = format("%08x", cacheNext);
     s.user = "user-" ~ (cacheNext % 1000).to!string;
-
-    s.tags.reserve(workPerRequest);
-    foreach (i; 0 .. workPerRequest)
-        s.tags ~= format("tag-%d-%d", cacheNext, i);
-
-    s.recent = new long[workPerRequest];
-    foreach (i; 0 .. workPerRequest)
+    s.recent = new long[16];
+    foreach (i; 0 .. s.recent.length)
         s.recent[i] = cast(long)(cacheNext + i);
-
-    // The rendering is the bulk of the per-request garbage, and it is the part
-    // a real handler would also do: build a string nobody keeps.
-    string body_;
-    body_.reserve(workPerRequest * 32);
-    foreach (i, t; s.tags)
-        body_ ~= format("%s=%d;", t, s.recent[i]);
-    s.rendered = body_;
 
     cacheRing[cacheNext % cacheRing.length] = s;
     cacheNext++;
+    return s;
+}
 
-    res.writeJsonBody([
-        "id": Json(s.id),
-        "user": Json(s.user),
-        "tags": Json(cast(long) s.tags.length),
-        "rendered": Json(cast(long) s.rendered.length),
-    ]);
+/**
+ * The per-request work both handlers do, so the only thing that differs between
+ * them is where it is allocated.
+ *
+ * Building the response as a string and writing it with `writeBody` rather than
+ * handing vibe.d a `Json` object to serialise, because the region handler has
+ * to write from outside its region and the two must not differ in the response
+ * path as well as in the allocation strategy.
+ */
+string renderPayload(size_t n, Session s)
+{
+    string[] tags;
+    tags.reserve(workPerRequest);
+    foreach (i; 0 .. workPerRequest)
+        tags ~= format("tag-%d-%d", n, i);
+
+    auto recent = new long[workPerRequest];
+    foreach (i; 0 .. workPerRequest)
+        recent[i] = cast(long)(n + i);
+
+    // The bulk of the per-request garbage, and the part a real handler would
+    // also do: build a string nobody keeps.
+    string body_;
+    body_.reserve(workPerRequest * 32);
+    foreach (i, t; tags)
+        body_ ~= format("%s=%d;", t, recent[i]);
+
+    return format(`{"id":"%s","user":"%s","tags":%d,"rendered":%d}`,
+                  s.id, s.user, tags.length, body_.length);
 }
 
 /// Printed on exit by every worker, so the driver can see what the collector
@@ -182,7 +283,7 @@ void startListener() nothrow
         auto router = new URLRouter;
         router.get("/plaintext", &handlePlaintext);
         router.get("/json", &handleJson);
-        router.get("/work", &handleWork);
+        router.get("/work", useRegion ? &handleWorkRegion : &handleWork);
 
         auto settings = new HTTPServerSettings;
         settings.port = gPort;
@@ -232,6 +333,13 @@ int main(string[] args)
             growth = a[9 .. $].to!size_t;
         else if (a.length > 11 && a[0 .. 11] == "--min-heap=")
             minHeapMb = a[11 .. $].to!size_t;
+        else if (a == "--region")
+            useRegion = true;
+        else if (a == "--region-verify")
+        {
+            useRegion = true;
+            verifyRegions = true;
+        }
         else
             rest ~= a;
     }
@@ -248,6 +356,8 @@ int main(string[] args)
         tgcHeapGrowth(growth);
     if (minHeapMb)
         tgcMinHeap(minHeapMb * 1024 * 1024);
+    if (verifyRegions)
+        tgcRegionVerify(true);
 
     if (threads > 1)
     {
@@ -256,9 +366,11 @@ int main(string[] args)
     }
     startListener();
 
-    printf("listening on 127.0.0.1:%d, %d thread(s), cache %d, work %d\n",
+    printf("listening on 127.0.0.1:%d, %d thread(s), cache %d, work %d%s%s\n",
            cast(int) port, cast(int) threads,
-           cast(int) cacheSize, cast(int) workPerRequest);
+           cast(int) cacheSize, cast(int) workPerRequest,
+           useRegion ? ", regions".ptr : "".ptr,
+           verifyRegions ? " (verified)".ptr : "".ptr);
 
     auto ret = runApplication(&rest);
     reportGC("main");

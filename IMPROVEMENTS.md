@@ -402,6 +402,29 @@ Two things this leaves:
   550 ms of pause to 530 ms, 3.6%. Not worth a per-chunk uniform-type invariant
   that has to stay correct through `realloc` and `setAttr`.
 
+### -1b. A region's chunks are built and thrown away per region
+
+Found by benchmarking a vibe.d server with a region per request
+(`bench/vibe/`). Opening and closing a region is essentially free at 32 ns.
+*Allocating* inside one is about three times the price of allocating outside:
+24 allocations cost 1,637 ns in a region against 566 ns without one.
+
+The reason is the ownership rule that makes regions work. A region owns its
+chunks exclusively, so it builds fresh ones and hands them back to the segment
+allocator at close -- a chunk creation, a metadata wipe and a release, per
+region per size class. When the work inside a region is large that is nothing;
+`bintree_region.d` shows regions winning outright. When a region is one HTTP
+request at ~25 microseconds it is 12-16% of throughput, and it is the entire
+reason the region column of the vibe.d benchmark is slower than the plain one
+despite doing a quarter of the collections.
+
+It is not contention: the penalty is the same at one thread and at four, which
+rules out the global segment lock (item -3).
+
+The fix is a per-thread cache of region chunks, so a closing region hands its
+chunks to the next region on that thread rather than to the segment allocator.
+The benchmark to validate it already exists.
+
 ### -1. Regions do not nest, and a throw out of one is a trap
 
 `tgcBeginRegion` returns null on a fiber that already has a region open, because
